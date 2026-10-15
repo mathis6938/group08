@@ -104,6 +104,13 @@ def main():
 
     # 3. Inspection avec PySpark
     print("\n=== 3. Inspection PySpark ===")
+    # Comme dans les labs : utiliser le Spark de $SPARK_HOME (/opt/spark, 3.5.0, Java 8)
+    # plutôt que le PySpark installé par pip (incompatible avec Java 8).
+    try:
+        import findspark
+        findspark.init()
+    except ImportError:
+        pass
     from pyspark.sql import SparkSession, functions as F
     spark = (SparkSession.builder.appName("opdi-check")
              .config("spark.sql.session.timeZone", "UTC").getOrCreate())
