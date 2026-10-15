@@ -1,0 +1,25 @@
+# Données : jamais dans le dépôt (elles vivent sur la VM, dans ~/opdi-data)
+data/
+*.parquet
+*.csv
+*.part
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Secrets / clés
+*.pem
+.env
+
+# OS / éditeurs
+.DS_Store
+Thumbs.db
+.vscode/
