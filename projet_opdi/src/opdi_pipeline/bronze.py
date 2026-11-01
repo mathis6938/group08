@@ -1,7 +1,14 @@
 """Bronze: schema check of the raw files, Bronze tables (original columns and types + row-level lineage),
-and reconciliation of the row counts between raw/ and bronze/."""
+and reconciliation of the row counts between raw/ and bronze/.
+
+The build is incremental: bronze/_state.json keeps the SHA-256 of the source file behind every Bronze period, and
+only new or republished files are (re)written, each one replacing its own partition. The reconciliation always
+checks every file of the scope. --full-refresh rebuilds everything (e.g. after a change of the Bronze code).
+"""
 import csv
 import hashlib
+import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -11,6 +18,9 @@ from pyspark.sql.functions import sum as spark_sum
 from . import ingestion, schemas
 from .common import QualityGateError, Steps, free_gb, log, parquet_gb, utc_now, write_report
 from .config import PARQUET_TABLES
+
+STATE_FILE = "_state.json"
+PERIOD_PATTERN = r"_(\d{6,8})(?:_\d{8})?\.parquet$"      # flight_list_202606 / flight_events_20260609_20260619
 
 LINEAGE_COLUMNS = ["_source_file", "_source_period", "_ingestion_run_id", "_ingested_at_utc",
                    "_source_last_modified", "_source_sha256", "_bronze_run_id", "_bronze_loaded_at_utc"]
@@ -86,26 +96,64 @@ def add_lineage(df, lineage, bronze_run_id):
     """Row-level lineage: each row gets its source file name, its period, and the file metadata of the manifest."""
     return (df
         .withColumn("_source_file", regexp_extract(input_file_name(), r"([^/]+)$", 1))
-        .withColumn("_source_period", regexp_extract(col("_source_file"), r"_(\d{6,8})(?:_\d{8})?\.parquet$", 1))
+        .withColumn("_source_period", regexp_extract(col("_source_file"), PERIOD_PATTERN, 1))
         .join(broadcast(lineage), "_source_file", "left")          # small table: broadcast join, no shuffle
         .withColumn("_bronze_run_id", lit(bronze_run_id))
         .withColumn("_bronze_loaded_at_utc", current_timestamp()))
 
 
+def load_state(settings):
+    path = settings.bronze_dir / STATE_FILE
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def bronze_location(settings, table, file_name):
+    """Folder holding the Bronze rows of one source file: its partition, or the whole table for a reference CSV."""
+    if table == "reference":
+        return settings.bronze_dir / Path(file_name).stem
+    return settings.bronze_dir / table / f"_source_period={re.search(PERIOD_PATTERN, file_name).group(1)}"
+
+
+def files_to_build(settings, files):
+    """Raw files whose Bronze copy is missing or comes from another version of the source file."""
+    sha_now = {name: r["sha256"] for name, r in ingestion.last_manifest_entries(settings).items()}
+    state = {} if settings.full_refresh else load_state(settings)
+    todo = {}
+    for table, paths in files.items():
+        for path in paths:
+            name = Path(path).name
+            up_to_date = (sha_now.get(name) is not None and state.get(name) == sha_now[name]
+                          and bronze_location(settings, table, name).exists())
+            if not up_to_date:
+                todo.setdefault(table, []).append(path)
+    return todo
+
+
 def build_tables(spark, settings, files):
-    """Bronze tables: original columns and types unchanged + lineage. OPDI tables partitioned by source period."""
+    """Bronze tables: original columns and types unchanged + lineage. OPDI tables partitioned by source period;
+    only the partitions of the given files are replaced (dynamic partition overwrite)."""
     lineage = file_lineage(spark, settings)
     for table in PARQUET_TABLES:
+        if not files.get(table):
+            continue
         (add_lineage(spark.read.parquet(*files[table]), lineage, settings.run_id)
             .write.mode("overwrite")                               # dynamic: only the periods written are replaced
             .partitionBy("_source_period")
             .parquet(str(settings.bronze_dir / table)))
-        log.info("%-13s -> %s", table, settings.bronze_dir / table)
+        log.info("%-13s -> %s (%d file(s))", table, settings.bronze_dir / table, len(files[table]))
     for path in files.get("reference", []):                        # airports, runways: every column kept as text
         table = Path(path).stem
         (add_lineage(read_reference_csv(spark, path), lineage, settings.run_id).drop("_source_period")
             .write.mode("overwrite").parquet(str(settings.bronze_dir / table)))
         log.info("%-13s -> %s", table, settings.bronze_dir / table)
+
+
+def save_state(settings, files):
+    """After a successful reconciliation: the source version (SHA-256) of every Bronze period of the scope."""
+    state = load_state(settings)
+    sha_now = {name: r["sha256"] for name, r in ingestion.last_manifest_entries(settings).items()}
+    state.update({Path(p).name: sha_now[Path(p).name] for paths in files.values() for p in paths})
+    (settings.bronze_dir / STATE_FILE).write_text(json.dumps(state, indent=1, sort_keys=True))
 
 
 def reconcile(spark, settings, files):
@@ -117,9 +165,11 @@ def reconcile(spark, settings, files):
     for path in files.get("reference", []):                        # CSV files: counted directly
         expected[Path(path).name] = read_reference_csv(spark, path).count()
 
+    scope = [Path(p).name for paths in files.values() for p in paths]
     recon = []
     for table in list(PARQUET_TABLES) + [Path(p).stem for p in files.get("reference", [])]:
         stats = (spark.read.parquet(str(settings.bronze_dir / table))
+                 .filter(col("_source_file").isin(scope))         # periods of another scope are kept, not checked
                  .groupBy("_source_file")
                  .agg(count("*").alias("n_rows"),
                       spark_sum(col("_source_sha256").isNull().cast("int")).alias("missing_lineage"))
@@ -152,8 +202,13 @@ def run(spark, settings):
                                               files_off_contract=off_contract, durations_s=steps.durations))
         raise QualityGateError(f"schema change at the source: {off_contract} do not match the schema contract "
                                "(a mapping in silver.standardize_* and a new contract are needed)")
+    todo = files_to_build(settings, files)
+    built = sorted(Path(p).name for paths in todo.values() for p in paths)
+    n_files = sum(len(v) for v in files.values())
+    log.info("%d of %d source files to (re)build in Bronze%s: %s", len(built), n_files,
+             " (full refresh)" if settings.full_refresh else "", built or "none, Bronze is up to date")
     with steps.step("Bronze tables"):
-        build_tables(spark, settings, files)
+        build_tables(spark, settings, todo)
     with steps.step("reconciliation"):
         passed, recon, n_expected = reconcile(spark, settings, files)
     total = sum(r["bronze_rows"] for r in recon)
@@ -161,8 +216,14 @@ def run(spark, settings):
     log.info("Files reconciled: %d/%d | rows in Bronze: %s | Bronze size: %.2f GB | free space left: %.1f GB",
              len(recon), n_expected, f"{total:,}", size, free_gb(settings.data_root))
     log.info("Reconciliation: %s", "PASSED" if passed else "FAILED")
+    if passed:
+        save_state(settings, files)
+    else:                                                          # unknown state: the next run rebuilds everything
+        (settings.bronze_dir / STATE_FILE).unlink(missing_ok=True)
     report = write_report(settings, "bronze", dict(
-        reconciliation_passed=passed, schema_variants=variants, files_off_contract=[], files_reconciled=len(recon),
+        reconciliation_passed=passed, schema_variants=variants, files_off_contract=[],
+        files_built=built, files_up_to_date=n_files - len(built), full_refresh=settings.full_refresh,
+        files_reconciled=len(recon),
         files_expected=n_expected, rows=total, size_gb=round(size, 3), reconciliation=recon,
         durations_s=steps.durations))
     if not passed:

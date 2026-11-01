@@ -8,7 +8,7 @@ on:
     branches: [main]
     paths: ["projet_opdi/**", ".github/workflows/dat535-prod.yml"]
   schedule:
-    - cron: "0 3 1 * *"            # monthly, 1st of the month at 03:00 UTC (rebuild and re-validation)
+    - cron: "0 3 1 * *"            # monthly, 1st of the month at 03:00 UTC (republished files, re-validation)
   workflow_dispatch:
     inputs:
       start:
@@ -17,6 +17,10 @@ on:
       end:
         description: "End of the scope, exclusive (YYYY-MM-DD, empty = 2026-07-29)"
         required: false
+      full_refresh:
+        description: "Rebuild every Bronze period, even the ones whose source file did not change"
+        type: boolean
+        default: false
 
 concurrency:                       # never two prod runs at the same time on the same data
   group: dat535-prod
@@ -68,6 +72,7 @@ jobs:
       OPDI_RUN_ID: prod-${{ github.run_number }}-${{ github.run_attempt }}   # shared by the layers of this run
       OPDI_START: ${{ github.event.inputs.start }}   # empty = value of config/prod.toml
       OPDI_END: ${{ github.event.inputs.end }}
+      OPDI_FULL_REFRESH: ${{ github.event.inputs.full_refresh }}   # empty/false = incremental Bronze
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

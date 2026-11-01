@@ -16,6 +16,7 @@ PARQUET_TABLES = ("flight_list", "flight_events", "measurements")
 ENV_VARS = {
     "OPDI_START": "start", "OPDI_END": "end", "OPDI_DATA_ROOT": "data_root", "OPDI_RUN_ID": "run_id",
     "OPDI_BASE_URL": "base_url", "OPDI_AIRPORTS_URL": "airports_url", "OPDI_RUNWAYS_URL": "runways_url",
+    "OPDI_FULL_REFRESH": "full_refresh",
 }
 
 
@@ -37,6 +38,7 @@ class Settings:
     driver_memory: str
     shuffle_partitions: int
     run_id: str                     # shared by all the layers of one run (reports/<run_id>/)
+    full_refresh: bool = False      # rebuild every Bronze period, even if its source file did not change
 
     @property
     def raw_dir(self):
@@ -75,6 +77,10 @@ class Settings:
         return {"airports.csv": self.airports_url, "runways.csv": self.runways_url}
 
 
+def _bool(value):
+    return value if isinstance(value, bool) else str(value).strip().lower() in ("1", "true", "yes")
+
+
 def _date(value):
     return value if isinstance(value, datetime.date) else datetime.date.fromisoformat(str(value))
 
@@ -100,7 +106,7 @@ def load_settings(env="prod", **overrides):
         origin=_date(values["origin"]), min_free_gb=float(values["min_free_gb"]), retries=int(values["retries"]),
         pause_s=float(values["pause_s"]), user_agent=values["user_agent"], app_name=values["app_name"],
         driver_memory=str(values["driver_memory"]), shuffle_partitions=int(values["shuffle_partitions"]),
-        run_id=str(values["run_id"]))
+        run_id=str(values["run_id"]), full_refresh=_bool(values.get("full_refresh", False)))
     if settings.start >= settings.end:
         raise ValueError(f"empty scope: start {settings.start} must be before end {settings.end}")
     return settings

@@ -24,6 +24,15 @@ def test_overrides_precedence(monkeypatch, tmp_path):
     assert s.start == datetime.date(2026, 6, 7) and s.end == datetime.date(2026, 6, 19)  # argument > environment
 
 
+def test_full_refresh_switch(monkeypatch):
+    assert load_settings("dev").full_refresh is False
+    monkeypatch.setenv("OPDI_FULL_REFRESH", "true")                 # workflow_dispatch input in GitHub Actions
+    assert load_settings("dev").full_refresh is True
+    monkeypatch.setenv("OPDI_FULL_REFRESH", "false")
+    assert load_settings("dev").full_refresh is False
+    assert load_settings("dev", full_refresh=True).full_refresh is True       # --full-refresh
+
+
 def test_invalid_settings():
     with pytest.raises(ValueError):
         load_settings("staging")
