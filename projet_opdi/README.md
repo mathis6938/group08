@@ -130,7 +130,7 @@ python -m pytest -v -m "not slow"        # sans les tests de bout en bout
   fautive. La synthèse est toujours produite, même après un échec.
 - **Visibilité :** chaque run affiche un résumé (contrôles qualité, lignes par table, motifs de quarantaine, étapes
   les plus lentes) et publie en artefacts les logs de chaque couche, les rapports JSON, `pipeline_summary.json`,
-  le manifeste et le rapport de schémas.
+  le manifeste, le rapport de schémas et les tables Gold (quelques Mo, analysables sans accès à la VM).
 - **Sécurité des runs :** un nouveau push sur `dev` annule le run dev en cours ; deux runs prod ne tournent jamais
   en même temps. Le marqueur `gold/_SUCCESS` est supprimé au début du Gold et n'est recréé que si la validation
   passe.

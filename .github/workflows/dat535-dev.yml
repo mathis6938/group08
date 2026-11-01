@@ -114,7 +114,8 @@ jobs:
           source ~/spark-env/bin/activate
           python projet_opdi/run_pipeline.py --env dev --layer summary 2>&1 | tee "$LOGS/5_summary.log"
 
-      - name: Upload logs, layer reports and quality results
+      # Gold tables: a few MB, so they can be analysed without access to the VM
+      - name: Upload logs, layer reports, quality results and Gold tables
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -125,5 +126,6 @@ jobs:
             ${{ env.DATA }}/pipeline_summary.json
             ${{ env.DATA }}/raw/manifest.csv
             ${{ env.DATA }}/raw/schema_report.csv
+            ${{ env.DATA }}/gold/
           retention-days: 7
           if-no-files-found: warn
