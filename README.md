@@ -18,10 +18,13 @@ Spark pipelines for learning distributed data processing.
 ├── lab3_advanced_spark.ipynb    # Lab 3 notebook: Window functions, joins, UDFs, streaming, production patterns
 └── .github/
     └── workflows/
-        ├── pipeline.yml         # Scheduled & dispatch pipeline workflow
-        ├── dat535-dev.yml       # Dev branch CI pipeline workflow
-        └── dat535-prod.yml      # Main branch production deployment workflow
+        ├── labs.yml             # Lab 2 & 3 pipelines, manual run
+        ├── dat535-dev.yml       # Final project (OPDI): tests + dev pipeline on push to dev
+        └── dat535-prod.yml      # Final project (OPDI): tests + approved production run (main, monthly)
 ```
+
+> **Final project:** the OPDI air-traffic pipeline lives in [projet_opdi/](projet_opdi/README.md);
+> the dev / prod workflows now run this project.
 
 ### Overview
 
@@ -130,18 +133,15 @@ The repo contains the automated workflows for the DAT535 project. These workflow
 
 We have configured the following automated processes:
 
-#### Pipeline ([pipeline.yml](.github/workflows/pipeline.yml))
+#### Project workflows ([dat535-dev.yml](.github/workflows/dat535-dev.yml), [dat535-prod.yml](.github/workflows/dat535-prod.yml))
 
-- **Triggers**:
-  - Scheduled cron job (monthly, 1st of the month at 00:00 UTC: `0 0 1 * *` which can be changed).
-  - Manual dispatch (workflow_dispatch).
-  - Push to `main` is defined in the file but currently commented out.
+The dev and prod workflows run the final project (OPDI air-traffic pipeline). See
+[projet_opdi/README.md](projet_opdi/README.md#cicd-github-actions) for triggers, jobs and results.
 
-- **Key Tasks**:
-  - Checks out the repository code.
-  - Activates the Python environment (`source ~/spark-env/bin/activate`).
-  - Sets environment variables (`SPARK_HOME=/opt/spark`, `JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64`).
-  - Executes all pipelines via `python $GITHUB_WORKSPACE/run_pipeline.py all`.
+#### Labs ([labs.yml](.github/workflows/labs.yml))
+
+- **Trigger**: manual dispatch only (choose `all`, `lab2` or `lab3`).
+- **Task**: `python $GITHUB_WORKSPACE/run_pipeline.py <lab>` on the self-hosted runner, outputs in `~/spark-lab-data/dev`.
 
 ### Infrastructure & Environment Setup
 

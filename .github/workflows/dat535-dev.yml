@@ -1,45 +1,131 @@
-name: DAT535 — Dev Pipeline
+name: DAT535 — Dev Pipeline (OPDI project)
+
+# Dev = sandbox. Every push to `dev` and every pull request is tested; then the whole pipeline runs layer by layer
+# on a small sample (one 10-day window, config/dev.toml) in a separate folder (~/opdi-data-dev), so a bad run never
+# touches prod data. A nightly run checks the source every day: thanks to the incremental Bronze it only rebuilds
+# the files EUROCONTROL republished (GitHub runs schedules with the workflow and code of the default branch, main).
 
 on:
   push:
     branches: [dev]
+    paths: ["projet_opdi/**", ".github/workflows/dat535-dev.yml"]
   pull_request:
-    branches: [dev]
+    branches: [dev, main]          # feature branch -> dev, and dev -> main (release)
+    paths: ["projet_opdi/**", ".github/workflows/**"]
+  schedule:
+    - cron: "17 2 * * *"           # nightly at 02:17 UTC: new or republished source files -> Bronze -> Gold
   workflow_dispatch:
+    inputs:
+      start:
+        description: "First day of the scope (YYYY-MM-DD, empty = dev default 2026-06-09)"
+        required: false
+      end:
+        description: "End of the scope, exclusive (YYYY-MM-DD, empty = dev default 2026-06-19)"
+        required: false
+      full_refresh:
+        description: "Rebuild every Bronze period, even the ones whose source file did not change"
+        type: boolean
+        default: false
+
+concurrency:                       # a new push cancels the dev run still in progress for the same branch
+  group: dat535-dev-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  run-dev:
-    name: Run Dev Pipeline
-    runs-on: self-hosted
-    environment: dev
-    env:
-      DAT535_ENV: dev
-      SPARK_HOME: /opt/spark
-      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
-
+  tests:
+    name: Unit and end-to-end tests
+    runs-on: ubuntu-latest         # GitHub-hosted: does not use the VM, works even when it is busy
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: projet_opdi
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Resolve output directory
-        id: output-dir
-        # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
-        run: echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: projet_opdi/requirements-test.txt
 
-      - name: Run Lab 2 & Lab 3 Pipelines
-        env:
-          DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
+      - name: Set up Java (Spark 3.5)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Run tests (config, ingestion, Silver rules, notebooks, whole pipeline on synthetic data)
+        run: python -m pytest -v
+
+  pipeline-dev:
+    name: Run pipeline on the dev sample
+    needs: tests
+    runs-on: self-hosted
+    environment: dev
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash                # bash -eo pipefail: a failing layer fails its step, even through tee
+    env:
+      SPARK_HOME: /opt/spark
+      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      OPDI_RUN_ID: dev-${{ github.run_number }}-${{ github.run_attempt }}   # shared by the layers of this run
+      OPDI_START: ${{ github.event.inputs.start }}   # empty = value of config/dev.toml
+      OPDI_END: ${{ github.event.inputs.end }}
+      OPDI_FULL_REFRESH: ${{ github.event.inputs.full_refresh }}   # empty/false = incremental Bronze
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Prepare folders
+        run: |
+          echo "DATA=$HOME/opdi-data-dev" >> "$GITHUB_ENV"
+          echo "LOGS=$HOME/opdi-data-dev/logs/$OPDI_RUN_ID" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/opdi-data-dev/logs/$OPDI_RUN_ID"
+
+      - name: "1/5 Ingest: download the OPDI and OurAirports files (raw/, manifest)"
         run: |
           source ~/spark-env/bin/activate
-          mkdir -p "$DAT535_OUTPUT_DIR"
-          
-          echo "=== Running Dev Pipeline ==="
-          python $GITHUB_WORKSPACE/run_pipeline.py all
+          python projet_opdi/run_pipeline.py --env dev --layer ingest 2>&1 | tee "$LOGS/1_ingest.log"
 
-      - name: Upload Dev artifacts
+      - name: "2/5 Bronze: schema check, tables with lineage, reconciliation"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer bronze 2>&1 | tee "$LOGS/2_bronze.log"
+
+      - name: "3/5 Silver: cleaning, quarantine, deduplication, enrichment, evidence"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer silver 2>&1 | tee "$LOGS/3_silver.log"
+
+      - name: "4/5 Gold: airport operations, validation, publication"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer gold 2>&1 | tee "$LOGS/4_gold.log"
+
+      - name: "5/5 Summary: quality gates of the run"
+        if: always()               # also after a failure: the summary shows which gate failed
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer summary 2>&1 | tee "$LOGS/5_summary.log"
+
+      # Gold tables: a few MB, so they can be analysed without access to the VM
+      - name: Upload logs, layer reports, quality results and Gold tables
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: dev-outputs-${{ github.run_number }}
-          path: ${{ steps.output-dir.outputs.dir }}/
+          name: opdi-dev-run-${{ github.run_number }}
+          path: |
+            ${{ env.LOGS }}/
+            ${{ env.DATA }}/reports/${{ env.OPDI_RUN_ID }}/
+            ${{ env.DATA }}/pipeline_summary.json
+            ${{ env.DATA }}/raw/manifest.csv
+            ${{ env.DATA }}/raw/schema_report.csv
+            ${{ env.DATA }}/gold/
           retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: warn

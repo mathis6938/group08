@@ -1,0 +1,4 @@
+# Test dependencies (GitHub-hosted runner). On the VM, Spark 3.5.0 comes from /opt/spark (findspark).
+pyspark==3.5.0
+pyarrow
+pytest

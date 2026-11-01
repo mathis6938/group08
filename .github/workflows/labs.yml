@@ -1,0 +1,41 @@
+name: DAT535 — Labs 2 & 3 pipelines (manual)
+
+# The lab pipelines (lab2_pipeline.py, lab3_pipeline.py) are kept runnable on demand.
+# The dev / prod workflows are now used by the OPDI project.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lab:
+        description: Lab to run
+        required: true
+        default: all
+        type: choice
+        options: [all, lab2, lab3]
+
+jobs:
+  run-labs:
+    name: Run lab pipelines
+    runs-on: self-hosted
+    env:
+      DAT535_ENV: dev
+      DAT535_OUTPUT_DIR: /home/ubuntu/spark-lab-data/dev
+      SPARK_HOME: /opt/spark
+      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Run labs
+        run: |
+          source ~/spark-env/bin/activate
+          mkdir -p "$DAT535_OUTPUT_DIR"
+          python $GITHUB_WORKSPACE/run_pipeline.py ${{ github.event.inputs.lab }}
+
+      - name: Upload lab outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: labs-outputs-${{ github.run_number }}
+          path: /home/ubuntu/spark-lab-data/dev/
+          retention-days: 7
+          if-no-files-found: ignore
