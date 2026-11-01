@@ -60,13 +60,17 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
                     orphan_events=0, invalid_coordinate_events=0, duplicate_events=0, out_of_scope_events=0)
     event_id = [1000]
 
-    def add_event(fid, kind, t, apt, alt, info="nan"):
+    def add_event(fid, kind, t, apt, alt, info="nan", north_km=0.0, flown_nm=None):
+        """One event (position: the airport, moved `north_km` to the north) + its measurements."""
         event_id[0] += 1
         lat, lon = coords.get(apt, (50.0, 5.0))
-        events.append(dict(id=event_id[0], flight_id=fid, type=kind, event_time=ts(t), longitude=lon, latitude=lat,
-                           altitude=alt, source="OSN", version="v0.0.2", info=info))
+        events.append(dict(id=event_id[0], flight_id=fid, type=kind, event_time=ts(t), longitude=lon,
+                           latitude=lat + north_km / 111.2, altitude=alt, source="OSN", version="v0.0.2", info=info))
         measurements.append(dict(id=event_id[0] * 10, event_id=event_id[0], type="Time passed (s)",
                                  value=float(rnd.randint(0, 9000)), version="v0.0.2"))
+        if flown_nm is not None:
+            measurements.append(dict(id=event_id[0] * 10 + 1, event_id=event_id[0], type="Distance flown (NM)",
+                                     value=float(flown_nm), version="v0.0.2"))
         return event_id[0]
 
     def add_flight(fid, adep, ades, start, minutes, icao24=None, first_seen=None, ground_events=True):
@@ -91,6 +95,23 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
         add_event(fid, "take-off", takeoff, adep, 600.0)
         add_event(fid, "first-xing-fl100", takeoff + datetime.timedelta(minutes=8), adep, 10000.0)
         add_event(fid, "top-of-climb", takeoff + datetime.timedelta(minutes=20), adep, 36000.0)
+        # Descent to the destination: top of descent 150 km north, 25 min before landing (or 31 min with a
+        # 6-minute holding pattern at FL120: level flight, distance flown but no displacement), FL100 at 50 km
+        # (distance flown: 7.5 NM per minute in descent, 4 NM per minute in the holding pattern)
+        holding = fid % 3 == 0
+        tod = landing - datetime.timedelta(minutes=31 if holding else 25)
+        add_event(fid, "top-of-descent", tod, ades, 36000.0, north_km=150.0, flown_nm=1000.0)
+        if holding:
+            add_event(fid, "level-start", tod + datetime.timedelta(minutes=5), ades, 12000.0, north_km=80.0,
+                      flown_nm=1037.5)
+            add_event(fid, "level-end", tod + datetime.timedelta(minutes=11), ades, 12000.0, north_km=80.0,
+                      flown_nm=1061.5)
+        add_event(fid, "last-xing-fl100", landing - datetime.timedelta(minutes=12), ades, 10000.0, north_km=50.0,
+                  flown_nm=1000.0 + (24 if holding else 0) + 13 * 7.5)
+        if ades in RUNWAYS:
+            add_event(fid, "entry-runway", landing - datetime.timedelta(seconds=30), ades, 350.0,
+                      osm_info("runway", "-".join(RUNWAYS[ades][0]), ades),
+                      flown_nm=1000.0 + (24 if holding else 0) + 24.5 * 7.5)
         add_event(fid, "landing", landing, ades, 300.0)
         if ades in RUNWAYS:
             rw = "-".join(rnd.choice(RUNWAYS[ades]))
