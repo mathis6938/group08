@@ -1,4 +1,5 @@
-"""End-to-end test: the whole notebook runs on a small synthetic OPDI dataset served by a fake EUROCONTROL server.
+"""End-to-end test: the whole pipeline runs on a small synthetic OPDI dataset served by a fake EUROCONTROL server,
+layer by layer through the command line, exactly as in GitHub Actions.
 
 It checks that every layer runs and that the pipeline finds exactly the defects put in the synthetic data.
 """
@@ -6,16 +7,24 @@ import functools
 import http.server
 import json
 import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
 
 import pytest
 
-import run_project
 from synthetic_opdi import START, END, write_site
 
-STUBS = Path(__file__).resolve().parent / "stubs"
+RUN_PIPELINE = Path(__file__).resolve().parents[1] / "run_pipeline.py"
+RUN_ID = "test-run"
+
+
+def run_cli(layers, env):
+    """python run_pipeline.py --env dev --layer <layers>, as a separate process (like a CI step)."""
+    proc = subprocess.run([sys.executable, str(RUN_PIPELINE), "--env", "dev", "--layer", layers],
+                          env=env, capture_output=True, text=True, timeout=900)
+    return proc.returncode, proc.stdout + proc.stderr
 
 
 @pytest.fixture(scope="module")
@@ -30,27 +39,18 @@ def pipeline_run(tmp_path_factory):
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{httpd.server_address[1]}"
 
-    settings = {
-        "OPDI_DATA_ROOT": str(data_root), "OPDI_START": str(START), "OPDI_END": str(END),
-        "OPDI_BASE_URL": f"{url}/opdi",
-        "OPDI_AIRPORTS_URL": f"{url}/ourairports/airports.csv",
-        "OPDI_RUNWAYS_URL": f"{url}/ourairports/runways.csv",
-        # the notebook kernel: findspark stand-in, Spark workers on the same Python
-        "PYTHONPATH": os.pathsep.join([str(STUBS), os.environ.get("PYTHONPATH", "")]),
-        "PYSPARK_PYTHON": sys.executable,
-    }
-    saved = {k: os.environ.get(k) for k in settings}
-    try:
-        ok, report, error = run_project.run_notebook(settings, data_root / "reports")
-    finally:
-        httpd.shutdown()
-        for k, v in saved.items():                     # leave the test process environment unchanged
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    assert ok, f"notebook failed (report: {report}):\n{error[-4000:]}"
-    return data_root, report, expected
+    env = {**os.environ,
+           "OPDI_DATA_ROOT": str(data_root), "OPDI_START": str(START), "OPDI_END": str(END), "OPDI_RUN_ID": RUN_ID,
+           "OPDI_BASE_URL": f"{url}/opdi",
+           "OPDI_AIRPORTS_URL": f"{url}/ourairports/airports.csv",
+           "OPDI_RUNWAYS_URL": f"{url}/ourairports/runways.csv",
+           "PYSPARK_PYTHON": sys.executable}
+    logs = {}
+    for layer in ("ingest", "bronze", "silver", "gold", "summary"):     # one process per layer, as in the CI
+        code, logs[layer] = run_cli(layer, env)
+        assert code == 0, f"layer {layer} failed:\n{logs[layer][-4000:]}"
+    yield data_root, env, expected, logs
+    httpd.shutdown()
 
 
 def read(spark, path):
@@ -58,9 +58,11 @@ def read(spark, path):
 
 
 @pytest.mark.slow
-def test_notebook_runs_and_publishes(pipeline_run):
-    data_root, report, _ = pipeline_run
-    assert report.exists() and report.with_suffix(".html").exists()
+def test_pipeline_runs_and_publishes(pipeline_run):
+    data_root, _, _, logs = pipeline_run
+    for layer in ("ingest", "bronze", "silver", "gold", "summary"):
+        assert (data_root / "reports" / RUN_ID / f"{layer}.json").exists()
+    assert "END-TO-END PIPELINE: PASSED" in logs["summary"]
     summary = json.loads((data_root / "pipeline_summary.json").read_text())
     assert summary["status"] == "PASSED", summary["gates"]
     assert all(summary["gates"].values())
@@ -69,7 +71,7 @@ def test_notebook_runs_and_publishes(pipeline_run):
 
 @pytest.mark.slow
 def test_bronze_keeps_every_row_with_lineage(pipeline_run, spark):
-    data_root, _, exp = pipeline_run
+    data_root, _, exp, _ = pipeline_run
     flights = read(spark, data_root / "bronze" / "flight_list")
     assert flights.count() == exp["bronze_flights"]
     assert flights.filter("_source_sha256 IS NULL OR _source_file IS NULL").count() == 0
@@ -80,7 +82,7 @@ def test_bronze_keeps_every_row_with_lineage(pipeline_run, spark):
 
 @pytest.mark.slow
 def test_silver_finds_the_planted_defects(pipeline_run, spark):
-    data_root, _, exp = pipeline_run
+    data_root, _, exp, _ = pipeline_run
     silver_fl = read(spark, data_root / "silver" / "flights")
     assert silver_fl.count() == exp["valid_flights"]               # duplicates and out-of-scope flights removed
     assert silver_fl.select("flight_id").distinct().count() == exp["valid_flights"]
@@ -103,7 +105,7 @@ def test_silver_finds_the_planted_defects(pipeline_run, spark):
 
 @pytest.mark.slow
 def test_gold_figures(pipeline_run, spark):
-    data_root, _, exp = pipeline_run
+    data_root, _, exp, _ = pipeline_run
     daily = read(spark, data_root / "gold" / "airport_daily_ops")
     tot = daily.agg({"departures": "sum", "arrivals": "sum"}).first()
     known_origin = exp["valid_flights"] - exp["valid_flights"] // 10
@@ -117,3 +119,33 @@ def test_gold_figures(pipeline_run, spark):
     row = ground.agg({"avg_taxi_out_min": "avg", "avg_taxi_in_min": "avg"}).first()
     assert row["avg(avg_taxi_out_min)"] == pytest.approx(9.0)     # exit-parking -> runway line-up = 9 min
     assert row["avg(avg_taxi_in_min)"] == pytest.approx(5.0)      # runway exit -> entry-parking = 5 min
+
+
+@pytest.mark.slow
+def test_rerun_is_idempotent(pipeline_run, spark):
+    """A second run on the same data gives the same tables (no duplicates, nothing downloaded again)."""
+    data_root, env, exp, _ = pipeline_run
+    before = json.loads((data_root / "pipeline_summary.json").read_text())["tables"]
+    code, out = run_cli("all", {**env, "OPDI_RUN_ID": "test-rerun"})
+    assert code == 0, out[-4000:]
+    after = json.loads((data_root / "pipeline_summary.json").read_text())["tables"]
+    assert [(t["table"], t["rows"]) for t in after] == [(t["table"], t["rows"]) for t in before]
+    ingest = json.loads((data_root / "reports" / "test-rerun" / "ingest.json").read_text())
+    assert ingest["results"] == {"already_present": 5}
+
+
+@pytest.mark.slow
+def test_failed_quality_gate_stops_the_run(pipeline_run):
+    """If a Bronze file loses its lineage (no valid manifest entry), the reconciliation fails and the run stops."""
+    data_root, env, _, _ = pipeline_run
+    manifest = data_root / "raw" / "manifest.csv"
+    original = manifest.read_text()
+    lines = original.splitlines()
+    manifest.write_text("\n".join(lines[:1] + [l.replace(",already_present,", ",failed,").replace(",downloaded,", ",failed,")
+                                              if "flight_list_" in l else l for l in lines[1:]]) + "\n")
+    try:
+        code, out = run_cli("bronze,silver", {**env, "OPDI_RUN_ID": "test-fail"})
+    finally:
+        manifest.write_text(original)
+    assert code == 1 and "QUALITY GATE FAILED" in out
+    assert not (data_root / "reports" / "test-fail" / "silver.json").exists()      # Silver did not run

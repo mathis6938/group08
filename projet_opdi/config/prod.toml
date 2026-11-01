@@ -1,0 +1,27 @@
+# Production: the full project scope, on the VM (~/opdi-data). Used by the `main` branch / prod workflow.
+# Any value can be overridden by an environment variable (OPDI_START, OPDI_END, OPDI_DATA_ROOT, ...)
+# or by the command line (--start, --end, --data-root).
+
+[scope]
+start = "2026-06-01"            # first day (inclusive)
+end   = "2026-07-29"            # last day (exclusive)
+
+[paths]
+data_root = "~/opdi-data"
+
+[sources]
+base_url     = "https://www.eurocontrol.int/performance/data/download/OPDI/v002"
+airports_url = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+runways_url  = "https://davidmegginson.github.io/ourairports-data/runways.csv"
+origin       = "2022-01-01"     # the OPDI 10-day windows are counted from this date
+
+[ingestion]
+min_free_gb = 4.0               # stop downloading below this free disk space
+retries     = 3                 # download attempts per file
+pause_s     = 0.5               # pause between two files
+user_agent  = "UiS-DAT535-group08"
+
+[spark]
+app_name           = "DAT535-OPDI-prod"
+driver_memory      = "2g"
+shuffle_partitions = 8
