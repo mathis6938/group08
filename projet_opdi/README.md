@@ -20,17 +20,20 @@ projet_opdi/
 ├── src/opdi_pipeline/           # le code du pipeline (une couche = un module)
 │   ├── config.py                #   lecture de la configuration (fichier < variables d'environnement < arguments)
 │   ├── spark.py                 #   SparkSession (UTC, AQE, partitions de shuffle)
-│   ├── ingestion.py             #   téléchargement, manifeste                       -> raw/
-│   ├── bronze.py                #   contrôle des schémas, traçabilité, réconciliation -> bronze/
+│   ├── ingestion.py             #   téléchargement, manifeste, fichiers republiés    -> raw/
+│   ├── bronze.py                #   contrats de schéma, traçabilité, réconciliation  -> bronze/
 │   ├── silver.py                #   nettoyage, quarantaine, doublons, enrichissement -> silver/, quarantine/
-│   ├── gold.py                  #   activité des aéroports, validation, publication  -> gold/
+│   │                            #   (API DataFrame)
+│   ├── gold.py + sql/*.sql      #   activité des aéroports en Spark SQL, validation, publication -> gold/
+│   ├── schemas.py               #   contrats de schéma : sources (raw), tables Silver et Gold publiées
 │   ├── quality.py               #   synthèse du run : contrôles qualité, volumes, durées
 │   ├── performance.py           #   mesures de performance (notebook 03)
 │   ├── common.py, cli.py        #   utilitaires, ligne de commande
 ├── notebooks/                   # vitrine pour le rapport et la démo (appellent le package)
 │   ├── 01_data_understanding.ipynb   # profilage des tables Bronze
 │   ├── 02_pipeline_walkthrough.ipynb # le pipeline couche par couche, avec les preuves de chaque couche
-│   └── 03_performance.ipynb          # goulots d'étranglement et optimisations mesurées
+│   ├── 03_performance.ipynb          # goulots d'étranglement et optimisations mesurées
+│   └── 04_gold_dashboard.ipynb       # tableau de bord : le consommateur du Gold (graphiques LFBO, ENZV...)
 ├── tests/                       # pytest (voir « Tests »)
 ├── requirements-test.txt, pytest.ini
 └── scripts/                     # scripts d'exploration du début du projet
@@ -67,8 +70,15 @@ python projet_opdi/run_pipeline.py --help
 - Couches : `ingest`, `bronze`, `silver`, `gold`, `summary` (ou `all`, la valeur par défaut). Elles communiquent
   uniquement par les tables écrites sur disque : chacune peut être relancée seule.
 - Le run s'arrête avec le code 1 si un contrôle qualité échoue. Les couches suivantes ne tournent pas, et le Gold
-  n'est pas publié. Les contrôles sont la réconciliation raw → Bronze, le bilan des lignes et l'intégrité
-  référentielle du Silver, et la validation du Gold.
+  n'est pas publié. Les contrôles :
+  - Bronze : fichiers sources conformes au contrat de schéma (un changement de schéma chez EUROCONTROL arrête le
+    run avant le Silver), réconciliation raw → Bronze ;
+  - Silver : bilan des lignes, intégrité référentielle, tables publiées conformes à leur contrat ;
+  - Gold : validation (réconciliation avec le Silver, cohérence, plages de valeurs), contrats de schéma.
+- Fichiers republiés : un fichier déjà présent est retéléchargé si la source en publie une nouvelle version
+  (taille ou `Last-Modified` différents). Le manifeste l'indique (`republished`), et le Bronze reconstruit la
+  période concernée avec la traçabilité de la nouvelle version. Les référentiels OurAirports, mis à jour
+  quotidiennement, sont ainsi rafraîchis à chaque changement.
 - Paramètres : `config/<env>.toml`. Les variables d'environnement `OPDI_START`, `OPDI_END`, `OPDI_DATA_ROOT`,
   `OPDI_RUN_ID` (et `OPDI_BASE_URL`, `OPDI_AIRPORTS_URL`, `OPDI_RUNWAYS_URL` pour les tests) les remplacent, et
   les arguments de la ligne de commande remplacent les variables.
@@ -87,10 +97,11 @@ python -m pytest -v -m "not slow"        # sans les tests de bout en bout
 | Fichier | Ce qui est testé |
 |---|---|
 | `test_config.py` | séparation dev / prod, ordre de priorité des paramètres, paramètres invalides |
-| `test_ingestion.py` | noms des fichiers OPDI (tranches de 10 jours alignées sur le 1er janvier 2022), téléchargement, SHA-256 |
+| `test_ingestion.py` | noms des fichiers OPDI (tranches de 10 jours alignées sur le 1er janvier 2022), téléchargement, SHA-256, fichiers republiés |
+| `test_schemas.py` | contrats de schéma ; un fichier source au schéma de 2025 (ids `decimal`, colonne en plus) est détecté |
 | `test_silver_rules.py` | nettoyage (valeurs manquantes, codes OACI, périmètre) et chaque règle de quarantaine |
 | `test_notebooks.py` | le code des notebooks vitrine reste valide |
-| `test_pipeline_smoke.py` | **tout le pipeline, couche par couche via la ligne de commande**, sur des données synthétiques servies par un faux serveur EUROCONTROL. On y a placé des défauts connus : doublons, dates illisibles, chronologie inversée, aéroports vides ou `"nan"`, événements orphelins, pistes traversées. Le test vérifie les chiffres exacts de chaque couche, qu'un second run donne les mêmes tables, et qu'un contrôle qualité en échec arrête le run |
+| `test_pipeline_smoke.py` | **tout le pipeline, couche par couche via la ligne de commande**, sur des données synthétiques servies par un faux serveur EUROCONTROL. On y a placé des défauts connus : doublons, dates illisibles, chronologie inversée, aéroports vides ou `"nan"`, événements orphelins, pistes traversées. Le test vérifie les chiffres exacts de chaque couche, les contrats de schéma des tables publiées, qu'un second run donne les mêmes tables, et qu'un contrôle qualité en échec arrête le run |
 
 ## CI/CD (GitHub Actions)
 

@@ -122,6 +122,17 @@ def test_gold_figures(pipeline_run, spark):
 
 
 @pytest.mark.slow
+def test_published_tables_match_their_schema_contract(pipeline_run, spark):
+    from opdi_pipeline import schemas
+    data_root, _, _, _ = pipeline_run
+    for layer, contracts in [("silver", schemas.SILVER), ("gold", schemas.GOLD)]:
+        for table, contract in contracts.items():
+            assert schemas.compare(read(spark, data_root / layer / table).schema, contract) == [], (layer, table)
+    gold = json.loads((data_root / "reports" / RUN_ID / "gold.json").read_text())
+    assert all(v for k, v in gold["checks"].items() if "schema" in k)
+
+
+@pytest.mark.slow
 def test_rerun_is_idempotent(pipeline_run, spark):
     """A second run on the same data gives the same tables (no duplicates, nothing downloaded again)."""
     data_root, env, exp, _ = pipeline_run

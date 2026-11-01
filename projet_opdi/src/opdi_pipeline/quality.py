@@ -17,9 +17,11 @@ def gates(settings):
     """Result of the checks made in each layer of this run (a layer that did not run counts as failed)."""
     bronze, silver, gold = (read_report(settings, layer) for layer in ("bronze", "silver", "gold"))
     return {
+        "Bronze: raw files match the schema contract": bool(bronze and not bronze.get("files_off_contract")),
         "Bronze: raw -> Bronze reconciliation": bool(bronze and bronze["reconciliation_passed"]),
         "Silver: row accounting consistent": bool(silver and silver["accounting_consistent"]),
         "Silver: no orphan event": bool(silver and silver["orphan_events"] == 0),
+        "Silver: tables match the schema contract": bool(silver and not any(silver["schema_problems"].values())),
         "Gold: validation checks": bool(gold and gold["validation_passed"]),
         "Gold: published (_SUCCESS marker)": (settings.gold_dir / "_SUCCESS").exists(),
     }

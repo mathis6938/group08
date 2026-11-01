@@ -12,7 +12,7 @@ NOTEBOOKS = sorted((Path(__file__).resolve().parents[1] / "notebooks").glob("*.i
 
 def test_there_are_showcase_notebooks():
     assert [n.name for n in NOTEBOOKS] == ["01_data_understanding.ipynb", "02_pipeline_walkthrough.ipynb",
-                                           "03_performance.ipynb"]
+                                           "03_performance.ipynb", "04_gold_dashboard.ipynb"]
 
 
 @pytest.mark.parametrize("notebook", NOTEBOOKS, ids=lambda p: p.name)
