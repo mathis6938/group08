@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -20,16 +21,24 @@ RUN_PIPELINE = Path(__file__).resolve().parents[1] / "run_pipeline.py"
 RUN_ID = "test-run"
 
 
-def run_cli(layers, env):
+def run_cli(layers, env, *extra):
     """python run_pipeline.py --env dev --layer <layers>, as a separate process (like a CI step)."""
-    proc = subprocess.run([sys.executable, str(RUN_PIPELINE), "--env", "dev", "--layer", layers],
+    proc = subprocess.run([sys.executable, str(RUN_PIPELINE), "--env", "dev", "--layer", layers, *extra],
                           env=env, capture_output=True, text=True, timeout=900)
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def report(data_root, run_id, layer):
+    return json.loads((data_root / "reports" / run_id / f"{layer}.json").read_text())
+
+
 @pytest.fixture(scope="module")
-def pipeline_run(tmp_path_factory):
-    site = tmp_path_factory.mktemp("site")
+def site(tmp_path_factory):
+    return tmp_path_factory.mktemp("site")
+
+
+@pytest.fixture(scope="module")
+def pipeline_run(tmp_path_factory, site):
     data_root = tmp_path_factory.mktemp("data")
     expected = write_site(site)
 
@@ -78,6 +87,8 @@ def test_bronze_keeps_every_row_with_lineage(pipeline_run, spark):
     assert read(spark, data_root / "bronze" / "flight_events").count() == exp["bronze_events"]
     manifest = (data_root / "raw" / "manifest.csv").read_text()
     assert manifest.count("downloaded") == 5                     # 3 OPDI files + 2 reference files
+    bronze = report(data_root, RUN_ID, "bronze")
+    assert len(bronze["files_built"]) == 5 and bronze["files_up_to_date"] == 0     # first run: everything built
 
 
 @pytest.mark.slow
@@ -141,8 +152,49 @@ def test_rerun_is_idempotent(pipeline_run, spark):
     assert code == 0, out[-4000:]
     after = json.loads((data_root / "pipeline_summary.json").read_text())["tables"]
     assert [(t["table"], t["rows"]) for t in after] == [(t["table"], t["rows"]) for t in before]
-    ingest = json.loads((data_root / "reports" / "test-rerun" / "ingest.json").read_text())
-    assert ingest["results"] == {"already_present": 5}
+    assert report(data_root, "test-rerun", "ingest")["results"] == {"already_present": 5}
+    bronze = report(data_root, "test-rerun", "bronze")
+    assert bronze["files_built"] == [] and bronze["files_up_to_date"] == 5        # incremental: nothing rebuilt
+    assert bronze["reconciliation_passed"]
+
+
+@pytest.mark.slow
+def test_republished_file_rebuilds_only_its_period(pipeline_run, site, spark):
+    """EUROCONTROL publishes a new version of one file: only that file is downloaded again and only its Bronze
+    period is rewritten; the other periods keep their rows and lineage, and the reconciliation still passes."""
+    import pyarrow.parquet as pq
+    data_root, env, exp, _ = pipeline_run
+    src = next((site / "opdi" / "flight_events").glob("*.parquet"))
+    pq.write_table(pq.read_table(src), src, compression="gzip")       # same rows, other bytes (new version)
+    later = time.time() + 120
+    os.utime(src, (later, later))
+
+    code, out = run_cli("ingest,bronze", {**env, "OPDI_RUN_ID": "test-republish"})
+    assert code == 0, out[-4000:]
+    assert report(data_root, "test-republish", "ingest")["results"] == {"republished": 1, "already_present": 4}
+    bronze = report(data_root, "test-republish", "bronze")
+    assert bronze["files_built"] == [src.name] and bronze["files_up_to_date"] == 4
+    assert bronze["reconciliation_passed"]
+
+    events = read(spark, data_root / "bronze" / "flight_events")
+    assert events.count() == exp["bronze_events"]                   # partition replaced, not appended
+    assert {r[0] for r in events.select("_bronze_run_id").distinct().collect()} == {"test-republish"}
+    assert {r[0] for r in read(spark, data_root / "bronze" / "flight_list")
+            .select("_bronze_run_id").distinct().collect()} == {RUN_ID}       # untouched
+    sha = ingestion_sha(data_root, src.name)
+    assert {r[0] for r in events.select("_source_sha256").distinct().collect()} == {sha}   # lineage of the new version
+
+    code, out = run_cli("bronze", {**env, "OPDI_RUN_ID": "test-full-refresh"}, "--full-refresh")
+    assert code == 0, out[-4000:]
+    bronze = report(data_root, "test-full-refresh", "bronze")
+    assert bronze["full_refresh"] and len(bronze["files_built"]) == 5 and bronze["reconciliation_passed"]
+    assert read(spark, data_root / "bronze" / "flight_events").count() == exp["bronze_events"]
+
+
+def ingestion_sha(data_root, name):
+    import csv
+    with open(data_root / "raw" / "manifest.csv", newline="") as f:
+        return [r["sha256"] for r in csv.DictReader(f) if r["file"] == name][-1]
 
 
 @pytest.mark.slow
@@ -160,3 +212,4 @@ def test_failed_quality_gate_stops_the_run(pipeline_run):
         manifest.write_text(original)
     assert code == 1 and "QUALITY GATE FAILED" in out
     assert not (data_root / "reports" / "test-fail" / "silver.json").exists()      # Silver did not run
+    assert not (data_root / "bronze" / "_state.json").exists()     # unknown state: the next run rebuilds everything

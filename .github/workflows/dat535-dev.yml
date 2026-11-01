@@ -2,7 +2,8 @@ name: DAT535 — Dev Pipeline (OPDI project)
 
 # Dev = sandbox. Every push to `dev` and every pull request is tested; then the whole pipeline runs layer by layer
 # on a small sample (one 10-day window, config/dev.toml) in a separate folder (~/opdi-data-dev), so a bad run never
-# touches prod data.
+# touches prod data. A nightly run checks the source every day: thanks to the incremental Bronze it only rebuilds
+# the files EUROCONTROL republished (GitHub runs schedules with the workflow and code of the default branch, main).
 
 on:
   push:
@@ -11,6 +12,8 @@ on:
   pull_request:
     branches: [dev, main]          # feature branch -> dev, and dev -> main (release)
     paths: ["projet_opdi/**", ".github/workflows/**"]
+  schedule:
+    - cron: "17 2 * * *"           # nightly at 02:17 UTC: new or republished source files -> Bronze -> Gold
   workflow_dispatch:
     inputs:
       start:
@@ -19,6 +22,10 @@ on:
       end:
         description: "End of the scope, exclusive (YYYY-MM-DD, empty = dev default 2026-06-19)"
         required: false
+      full_refresh:
+        description: "Rebuild every Bronze period, even the ones whose source file did not change"
+        type: boolean
+        default: false
 
 concurrency:                       # a new push cancels the dev run still in progress for the same branch
   group: dat535-dev-${{ github.ref }}
@@ -70,6 +77,7 @@ jobs:
       OPDI_RUN_ID: dev-${{ github.run_number }}-${{ github.run_attempt }}   # shared by the layers of this run
       OPDI_START: ${{ github.event.inputs.start }}   # empty = value of config/dev.toml
       OPDI_END: ${{ github.event.inputs.end }}
+      OPDI_FULL_REFRESH: ${{ github.event.inputs.full_refresh }}   # empty/false = incremental Bronze
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

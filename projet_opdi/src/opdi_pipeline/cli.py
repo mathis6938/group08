@@ -3,6 +3,7 @@
     python projet_opdi/run_pipeline.py --env dev --layer all              # the whole pipeline
     python projet_opdi/run_pipeline.py --env dev --layer silver           # one layer (inputs already on disk)
     python projet_opdi/run_pipeline.py --env prod --layer bronze,silver --start 2026-06-01 --end 2026-06-11
+    python projet_opdi/run_pipeline.py --env prod --full-refresh           # rebuild all the Bronze periods
 
 Exit code 1 if a layer fails (e.g. a quality gate): the next layers are not run, the summary is still written.
 """
@@ -40,12 +41,16 @@ def main(argv=None):
     parser.add_argument("--end", help="end of the scope, exclusive, YYYY-MM-DD (overrides the config)")
     parser.add_argument("--data-root", help="data folder (overrides the config)")
     parser.add_argument("--run-id", help="identifier shared by the layers of one run (default: OPDI_RUN_ID or time)")
+    parser.add_argument("--full-refresh", action="store_true", default=None,
+                        help="rebuild every Bronze period, even if its source file did not change")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", stream=sys.stdout)
-    settings = load_settings(args.env, start=args.start, end=args.end, data_root=args.data_root, run_id=args.run_id)
-    log.info("OPDI pipeline | env=%s | layers=%s | scope [%s, %s[ | data %s | run %s", settings.env,
-             ",".join(args.layer), settings.start, settings.end, settings.data_root, settings.run_id)
+    settings = load_settings(args.env, start=args.start, end=args.end, data_root=args.data_root, run_id=args.run_id,
+                             full_refresh=args.full_refresh)
+    log.info("OPDI pipeline | env=%s | layers=%s | scope [%s, %s[ | data %s | run %s%s", settings.env,
+             ",".join(args.layer), settings.start, settings.end, settings.data_root, settings.run_id,
+             " | full refresh" if settings.full_refresh else "")
 
     spark = None
     if any(layer != "ingest" for layer in args.layer):
