@@ -11,6 +11,7 @@ from pyspark.sql.functions import round as spark_round
 from pyspark.sql.functions import sum as spark_sum
 from pyspark.sql.types import DoubleType, LongType, MapType, StringType
 
+from . import schemas
 from .common import QualityGateError, Steps, free_gb, log, parquet_gb, write_report, write_table
 
 
@@ -348,11 +349,18 @@ def run(spark, settings):
 
     with steps.step("before/after evidence"):
         ev = evidence(spark, settings, bronze_flights, bronze_events, std_flights, std_events, quar_schemas)
+    schema_problems = {t: schemas.compare(spark.read.parquet(str(s / t)).schema, schemas.SILVER[t])
+                       for t in schemas.SILVER}
+    for t, problems in schema_problems.items():
+        for p in problems:
+            log.error("  schema of silver/%s: %s", t, p)
     report = write_report(settings, "silver", dict(
-        flight_outcomes=outcomes, **ev, size_gb=round(parquet_gb(s), 3),
+        flight_outcomes=outcomes, **ev, schema_problems=schema_problems, size_gb=round(parquet_gb(s), 3),
         quarantine_size_gb=round(parquet_gb(q), 3), durations_s=steps.durations))
     if not ev["accounting_consistent"]:
         raise QualityGateError("Silver row accounting inconsistent (negative number of duplicates)")
     if ev["orphan_events"]:
         raise QualityGateError(f"{ev['orphan_events']} Silver events have no Silver flight")
+    if any(schema_problems.values()):
+        raise QualityGateError(f"Silver tables do not match their schema contract: {schema_problems}")
     return report

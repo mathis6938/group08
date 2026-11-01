@@ -1,5 +1,9 @@
 """Ingestion (landing zone): download the OPDI and OurAirports files of the scope into raw/, unchanged,
-and record every file in raw/manifest.csv (URL, size, Last-Modified, SHA-256, run id, result)."""
+and record every file in raw/manifest.csv (URL, size, Last-Modified, SHA-256, run id, result).
+
+A file already in raw/ is downloaded again only if the source published a new version of it (different size or
+Last-Modified than the copy we have): EUROCONTROL republishes corrected files, and OurAirports is updated daily.
+"""
 import csv
 import datetime
 import hashlib
@@ -13,7 +17,7 @@ from collections import Counter
 from .common import Steps, free_gb, log, utc_now, write_report
 from .config import PARQUET_TABLES
 
-OK_RESULTS = ("downloaded", "already_present")
+OK_RESULTS = ("downloaded", "already_present", "republished")
 
 
 def months(start, end):
@@ -95,6 +99,25 @@ def sha256(path):
     return h.hexdigest()
 
 
+def last_manifest_entries(settings):
+    """Latest successful manifest entry of each file (the manifest is chronological: the last entry wins)."""
+    latest = {}
+    if settings.manifest_path.exists():
+        with open(settings.manifest_path, newline="") as f:
+            for r in csv.DictReader(f):
+                if r["result"] in OK_RESULTS:
+                    latest[r["file"]] = r
+    return latest
+
+
+def is_republished(local_path, remote_size, remote_last_modified, previous):
+    """True if the source holds another version of a file we already have."""
+    if remote_size and local_path.stat().st_size != remote_size:
+        return True
+    old = (previous or {}).get("last_modified", "")
+    return bool(old and remote_last_modified and old != remote_last_modified)
+
+
 def run(settings):
     """Download the files of the scope that are not in raw/ yet, and append one manifest row per file."""
     steps = Steps()
@@ -103,6 +126,7 @@ def run(settings):
     log.info("Period [%s, %s[ | %d files | destination %s | free %.1f GB",
              settings.start, settings.end, len(files), settings.raw_dir, free_gb(settings.raw_dir))
     rows = []
+    previous = last_manifest_entries(settings)
     with steps.step("download"):
         for i, (table, name, url) in enumerate(files, 1):
             status, size, last_modified = head(url, settings.user_agent)
@@ -112,13 +136,17 @@ def run(settings):
                 result = "absent"
             elif size == 0:
                 result = "empty"
-            elif dest.exists():
+            elif dest.exists() and not is_republished(dest, size, last_modified, previous.get(name)):
                 result = "already_present"
             elif free_gb(settings.raw_dir) - size / 1e9 < settings.min_free_gb:
                 log.error("STOP: insufficient free space before %s", name)
                 break
             else:
+                republished = dest.exists()          # new version: the .part download replaces the old copy
                 result = download(url, dest, settings.retries, settings.user_agent)
+                if republished and result == "downloaded":
+                    result = "republished"
+                    log.warning("    %s was republished by the source: new version downloaded", name)
             ok = result in OK_RESULTS
             rows.append(dict(run_id=settings.run_id, table=table, file=name, url=url, http_status=status,
                              size_bytes=size, last_modified=last_modified, result=result,

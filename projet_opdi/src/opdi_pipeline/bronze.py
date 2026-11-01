@@ -8,7 +8,7 @@ from pathlib import Path
 from pyspark.sql.functions import broadcast, col, count, current_timestamp, input_file_name, lit, regexp_extract
 from pyspark.sql.functions import sum as spark_sum
 
-from . import ingestion
+from . import ingestion, schemas
 from .common import QualityGateError, Steps, free_gb, log, parquet_gb, utc_now, write_report
 from .config import PARQUET_TABLES
 
@@ -26,7 +26,8 @@ def check_schemas(spark, settings):
     """Schema fingerprint and row count of every raw Parquet file (raw/schema_report.csv), grouped by variant.
 
     OPDI files from different periods were observed with different schemas (e.g. `long` vs `decimal(20,0)` ids,
-    dates as `string` vs `timestamp`): all the files of a table must share one schema before Silver.
+    dates as `string` vs `timestamp`). Every file must match the schema contract of its table (schemas.RAW):
+    otherwise the run stops here, before Silver reads data it was not written for.
     """
     variants = defaultdict(lambda: defaultdict(list))             # table -> schema -> files
     rows = []
@@ -36,8 +37,12 @@ def check_schemas(spark, settings):
             schema = tuple((f.name, f.dataType.simpleString()) for f in df.schema.fields)
             fingerprint = hashlib.sha256(str(schema).encode()).hexdigest()[:12]
             variants[table][schema].append(path.name)
+            problems = schemas.compare(df.schema, schemas.RAW[table])
             rows.append(dict(table=table, file=path.name, n_rows=df.count(), n_columns=len(schema),
-                             schema_fingerprint=fingerprint, checked_at_utc=utc_now().isoformat(timespec="seconds")))
+                             schema_fingerprint=fingerprint, matches_contract=not problems,
+                             checked_at_utc=utc_now().isoformat(timespec="seconds")))
+            for p in problems:
+                log.error("  %s does not match the schema contract of %s: %s", path.name, table, p)
 
     for table, by_schema in variants.items():
         keys = list(by_schema)
@@ -68,12 +73,8 @@ def check_schemas(spark, settings):
 
 # ---------------------------------------------------------------------------------------------- tables
 def file_lineage(spark, settings):
-    """Latest successful manifest entry of each file (the manifest is chronological: the last entry wins)."""
-    latest = {}
-    with open(settings.manifest_path, newline="") as f:
-        for r in csv.DictReader(f):
-            if r["result"] in ingestion.OK_RESULTS:
-                latest[r["file"]] = r
+    """Latest successful manifest entry of each file, as a small DataFrame joined to every Bronze row."""
+    latest = ingestion.last_manifest_entries(settings)
     return spark.createDataFrame(
         [(name, r["run_id"], r["retrieved_at_utc"], r["last_modified"], r["sha256"]) for name, r in latest.items()],
         "_source_file string, _ingestion_run_id string, _ingested_at_utc string, "
@@ -145,6 +146,12 @@ def run(spark, settings):
         raise QualityGateError(f"no raw file of the scope in {settings.raw_dir}: run the ingest layer first")
     with steps.step("schema check"):
         variants, schema_rows = check_schemas(spark, settings)
+    off_contract = [r["file"] for r in schema_rows if not r["matches_contract"]]
+    if off_contract:
+        write_report(settings, "bronze", dict(reconciliation_passed=False, schema_variants=variants,
+                                              files_off_contract=off_contract, durations_s=steps.durations))
+        raise QualityGateError(f"schema change at the source: {off_contract} do not match the schema contract "
+                               "(a mapping in silver.standardize_* and a new contract are needed)")
     with steps.step("Bronze tables"):
         build_tables(spark, settings, files)
     with steps.step("reconciliation"):
@@ -155,7 +162,7 @@ def run(spark, settings):
              len(recon), n_expected, f"{total:,}", size, free_gb(settings.data_root))
     log.info("Reconciliation: %s", "PASSED" if passed else "FAILED")
     report = write_report(settings, "bronze", dict(
-        reconciliation_passed=passed, schema_variants=variants, files_reconciled=len(recon),
+        reconciliation_passed=passed, schema_variants=variants, files_off_contract=[], files_reconciled=len(recon),
         files_expected=n_expected, rows=total, size_gb=round(size, 3), reconciliation=recon,
         durations_s=steps.durations))
     if not passed:

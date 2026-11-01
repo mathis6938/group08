@@ -3,7 +3,9 @@ import datetime
 import functools
 import hashlib
 import http.server
+import os
 import threading
+import time
 
 import pytest
 
@@ -70,3 +72,31 @@ def test_failed_download_leaves_nothing(http_site, tmp_path):
     dest = tmp_path / "missing.parquet"
     assert ingestion.download(f"{url}/missing.parquet", dest, retries=2, wait_s=0) == "failed"
     assert not dest.exists() and not dest.with_name("missing.parquet.part").exists()
+
+
+def test_republished_files_are_downloaded_again(http_site, tmp_path):
+    """A file is downloaded again only when the source holds another version (size or Last-Modified changed)."""
+    site, url = http_site
+    for table, name in [("flight_list", "flight_list_202606.parquet"),
+                        ("flight_events", "flight_events_20260609_20260619.parquet"),
+                        ("measurements", "measurements_20260609_20260619.parquet")]:
+        (site / "opdi" / table).mkdir(parents=True)
+        (site / "opdi" / table / name).write_bytes(b"v1" * 100)
+    (site / "airports.csv").write_text("ident\nLFBO\n")
+    (site / "runways.csv").write_text("airport_ident\nLFBO\n")
+    settings = load_settings("dev", data_root=str(tmp_path / "data"), base_url=f"{url}/opdi", pause_s=0,
+                             airports_url=f"{url}/airports.csv", runways_url=f"{url}/runways.csv")
+
+    assert ingestion.run(settings)["results"] == {"downloaded": 5}
+    assert ingestion.run(settings)["results"] == {"already_present": 5}
+
+    events = site / "opdi" / "flight_events" / "flight_events_20260609_20260619.parquet"
+    events.write_bytes(b"v2" * 150)                              # corrected file, other size
+    later = time.time() + 120
+    runways = site / "runways.csv"
+    os.utime(runways, (later, later))                            # same content, new Last-Modified
+    report = ingestion.run(settings)
+    assert report["results"] == {"republished": 2, "already_present": 3}
+    assert (settings.raw_dir / "flight_events" / events.name).read_bytes() == b"v2" * 150
+    latest = ingestion.last_manifest_entries(settings)
+    assert latest[events.name]["sha256"] == hashlib.sha256(b"v2" * 150).hexdigest()   # lineage of the new version
