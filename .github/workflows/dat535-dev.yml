@@ -1,14 +1,15 @@
 name: DAT535 — Dev Pipeline (OPDI project)
 
-# Dev = sandbox: every push to `dev` is tested, then the whole pipeline runs on a small sample
-# (one 10-day window) in a separate data folder (~/opdi-data-dev), so a bad run never touches prod data.
+# Dev = sandbox. Every push to `dev` and every pull request is tested; then the whole pipeline runs layer by layer
+# on a small sample (one 10-day window, config/dev.toml) in a separate folder (~/opdi-data-dev), so a bad run never
+# touches prod data.
 
 on:
   push:
     branches: [dev]
     paths: ["projet_opdi/**", ".github/workflows/dat535-dev.yml"]
   pull_request:
-    branches: [main]
+    branches: [dev, main]          # feature branch -> dev, and dev -> main (release)
     paths: ["projet_opdi/**", ".github/workflows/**"]
   workflow_dispatch:
     inputs:
@@ -51,7 +52,7 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements-test.txt
 
-      - name: Run tests (ingestion, Silver rules, whole notebook on synthetic data)
+      - name: Run tests (config, ingestion, Silver rules, notebooks, whole pipeline on synthetic data)
         run: python -m pytest -v
 
   pipeline-dev:
@@ -60,42 +61,61 @@ jobs:
     runs-on: self-hosted
     environment: dev
     timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash                # bash -eo pipefail: a failing layer fails its step, even through tee
     env:
       SPARK_HOME: /opt/spark
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      OPDI_RUN_ID: dev-${{ github.run_number }}-${{ github.run_attempt }}   # shared by the layers of this run
+      OPDI_START: ${{ github.event.inputs.start }}   # empty = value of config/dev.toml
+      OPDI_END: ${{ github.event.inputs.end }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Resolve folders
-        id: dirs
+      - name: Prepare folders
         run: |
-          echo "data=$HOME/opdi-data-dev" >> "$GITHUB_OUTPUT"
-          echo "report=$HOME/opdi-data-dev/reports/run-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "DATA=$HOME/opdi-data-dev" >> "$GITHUB_ENV"
+          echo "LOGS=$HOME/opdi-data-dev/logs/$OPDI_RUN_ID" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/opdi-data-dev/logs/$OPDI_RUN_ID"
 
-      - name: Check notebook runner dependencies
-        run: |
-          source ~/spark-env/bin/activate
-          python -c "import nbclient, nbconvert, ipykernel, findspark" 2>/dev/null \
-            || pip install --quiet nbclient nbconvert ipykernel findspark
-
-      - name: Run the pipeline notebook (dev)
+      - name: "1/5 Ingest: download the OPDI and OurAirports files (raw/, manifest)"
         run: |
           source ~/spark-env/bin/activate
-          python projet_opdi/run_project.py --env dev \
-            ${{ github.event.inputs.start && format('--start {0}', github.event.inputs.start) || '' }} \
-            ${{ github.event.inputs.end && format('--end {0}', github.event.inputs.end) || '' }} \
-            --report-dir "${{ steps.dirs.outputs.report }}"
+          python projet_opdi/run_pipeline.py --env dev --layer ingest 2>&1 | tee "$LOGS/1_ingest.log"
 
-      - name: Upload run report and quality results
+      - name: "2/5 Bronze: schema check, tables with lineage, reconciliation"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer bronze 2>&1 | tee "$LOGS/2_bronze.log"
+
+      - name: "3/5 Silver: cleaning, quarantine, deduplication, enrichment, evidence"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer silver 2>&1 | tee "$LOGS/3_silver.log"
+
+      - name: "4/5 Gold: airport operations, validation, publication"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer gold 2>&1 | tee "$LOGS/4_gold.log"
+
+      - name: "5/5 Summary: quality gates of the run"
+        if: always()               # also after a failure: the summary shows which gate failed
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer summary 2>&1 | tee "$LOGS/5_summary.log"
+
+      - name: Upload logs, layer reports and quality results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: opdi-dev-run-${{ github.run_number }}
           path: |
-            ${{ steps.dirs.outputs.report }}/
-            ${{ steps.dirs.outputs.data }}/pipeline_summary.json
-            ${{ steps.dirs.outputs.data }}/raw/manifest.csv
-            ${{ steps.dirs.outputs.data }}/raw/schema_report.csv
+            ${{ env.LOGS }}/
+            ${{ env.DATA }}/reports/${{ env.OPDI_RUN_ID }}/
+            ${{ env.DATA }}/pipeline_summary.json
+            ${{ env.DATA }}/raw/manifest.csv
+            ${{ env.DATA }}/raw/schema_report.csv
           retention-days: 7
           if-no-files-found: warn

@@ -1,7 +1,7 @@
 name: DAT535 — Production Pipeline (OPDI project)
 
-# Prod = the trusted version: runs after a merge into `main` (and once a month), only after a reviewer
-# approves the deployment (GitHub environment `main`), on the full scope in ~/opdi-data.
+# Prod = the trusted version. Runs after a merge into `main` and once a month, only after a reviewer approves the
+# deployment (GitHub environment `main`), on the full scope (config/prod.toml) in ~/opdi-data.
 
 on:
   push:
@@ -25,7 +25,7 @@ concurrency:                       # never two prod runs at the same time on the
 jobs:
   tests:
     name: Unit and end-to-end tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest         # GitHub-hosted: does not use the VM, works even when it is busy
     timeout-minutes: 30
     defaults:
       run:
@@ -50,7 +50,7 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements-test.txt
 
-      - name: Run tests
+      - name: Run tests (config, ingestion, Silver rules, notebooks, whole pipeline on synthetic data)
         run: python -m pytest -v
 
   pipeline-prod:
@@ -59,42 +59,61 @@ jobs:
     runs-on: self-hosted
     environment: main              # required reviewer: the run waits for a manual approval
     timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash                # bash -eo pipefail: a failing layer fails its step, even through tee
     env:
       SPARK_HOME: /opt/spark
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      OPDI_RUN_ID: prod-${{ github.run_number }}-${{ github.run_attempt }}   # shared by the layers of this run
+      OPDI_START: ${{ github.event.inputs.start }}   # empty = value of config/prod.toml
+      OPDI_END: ${{ github.event.inputs.end }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Resolve folders
-        id: dirs
+      - name: Prepare folders
         run: |
-          echo "data=$HOME/opdi-data" >> "$GITHUB_OUTPUT"
-          echo "report=$HOME/opdi-data/reports/run-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "DATA=$HOME/opdi-data" >> "$GITHUB_ENV"
+          echo "LOGS=$HOME/opdi-data/logs/$OPDI_RUN_ID" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/opdi-data/logs/$OPDI_RUN_ID"
 
-      - name: Check notebook runner dependencies
-        run: |
-          source ~/spark-env/bin/activate
-          python -c "import nbclient, nbconvert, ipykernel, findspark" 2>/dev/null \
-            || pip install --quiet nbclient nbconvert ipykernel findspark
-
-      - name: Run the pipeline notebook (prod)
+      - name: "1/5 Ingest: download the OPDI and OurAirports files (raw/, manifest)"
         run: |
           source ~/spark-env/bin/activate
-          python projet_opdi/run_project.py --env prod \
-            ${{ github.event.inputs.start && format('--start {0}', github.event.inputs.start) || '' }} \
-            ${{ github.event.inputs.end && format('--end {0}', github.event.inputs.end) || '' }} \
-            --report-dir "${{ steps.dirs.outputs.report }}"
+          python projet_opdi/run_pipeline.py --env prod --layer ingest 2>&1 | tee "$LOGS/1_ingest.log"
 
-      - name: Upload run report and quality results
+      - name: "2/5 Bronze: schema check, tables with lineage, reconciliation"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env prod --layer bronze 2>&1 | tee "$LOGS/2_bronze.log"
+
+      - name: "3/5 Silver: cleaning, quarantine, deduplication, enrichment, evidence"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env prod --layer silver 2>&1 | tee "$LOGS/3_silver.log"
+
+      - name: "4/5 Gold: airport operations, validation, publication"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env prod --layer gold 2>&1 | tee "$LOGS/4_gold.log"
+
+      - name: "5/5 Summary: quality gates of the run"
+        if: always()               # also after a failure: the summary shows which gate failed
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env prod --layer summary 2>&1 | tee "$LOGS/5_summary.log"
+
+      - name: Upload logs, layer reports and quality results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: opdi-prod-run-${{ github.run_number }}
           path: |
-            ${{ steps.dirs.outputs.report }}/
-            ${{ steps.dirs.outputs.data }}/pipeline_summary.json
-            ${{ steps.dirs.outputs.data }}/raw/manifest.csv
-            ${{ steps.dirs.outputs.data }}/raw/schema_report.csv
+            ${{ env.LOGS }}/
+            ${{ env.DATA }}/reports/${{ env.OPDI_RUN_ID }}/
+            ${{ env.DATA }}/pipeline_summary.json
+            ${{ env.DATA }}/raw/manifest.csv
+            ${{ env.DATA }}/raw/schema_report.csv
           retention-days: 30
           if-no-files-found: warn

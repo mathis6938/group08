@@ -2,7 +2,3 @@
 pyspark==3.5.0
 pyarrow
 pytest
-nbformat
-nbclient
-nbconvert
-ipykernel
