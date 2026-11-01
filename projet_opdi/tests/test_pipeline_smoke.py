@@ -111,9 +111,9 @@ def test_gold_figures(pipeline_run, spark):
 
     runway = read(spark, data_root / "gold" / "runway_usage")
     assert runway.agg({"runway_movements": "sum"}).first()[0] == known_origin + exp["valid_flights"]
-    assert runway.filter("length_ft IS NULL").count() == 0        # every OSM reference matched a runway
+    assert runway.filter("length_ft IS NULL").count() == 0        # "14L/32R" and "14L-32R" both matched
 
     ground = read(spark, data_root / "gold" / "airport_ground_times").filter("airport_icao = 'LFBO'")
     row = ground.agg({"avg_taxi_out_min": "avg", "avg_taxi_in_min": "avg"}).first()
-    assert row["avg(avg_taxi_out_min)"] == pytest.approx(10.0)    # exit-parking -> take-off = 10 min
-    assert row["avg(avg_taxi_in_min)"] == pytest.approx(6.0)      # landing -> entry-parking = 6 min
+    assert row["avg(avg_taxi_out_min)"] == pytest.approx(9.0)     # exit-parking -> runway line-up = 9 min
+    assert row["avg(avg_taxi_in_min)"] == pytest.approx(5.0)      # runway exit -> entry-parking = 5 min

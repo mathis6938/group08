@@ -41,6 +41,12 @@ MS_SCHEMA = pa.schema([("id", pa.int64()), ("event_id", pa.int64()), ("type", pa
                        ("value", pa.float64()), ("version", pa.string())])
 
 
+def osm_info(aeroway, ref, airport):
+    """`info` JSON of an OPDI airport event (same keys as the real data)."""
+    return json.dumps({"osm_id": 1000 + len(ref), "osm_aeroway": aeroway, "osm_ref": ref, "osm_airport": airport,
+                       "opdi_time_in_use_s": 120, "osn_icao24": "4ca000", "osn_flight_id": "AFR1    "})
+
+
 def ts(t):
     return t.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -75,21 +81,25 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
             return
         takeoff, landing = start + datetime.timedelta(minutes=12), end - datetime.timedelta(minutes=10)
         if adep in RUNWAYS:
-            rw = "/".join(rnd.choice(RUNWAYS[adep]))
+            rw = "/".join(rnd.choice(RUNWAYS[adep]))          # OSM references: "14L/32R" or "14L-32R"
             add_event(fid, "exit-parking_position", start + datetime.timedelta(minutes=2), adep, 500.0,
-                      json.dumps({"ref": "A12", "aeroway": "parking_position", "airport": adep}))
+                      osm_info("parking_position", "A12", adep))
+            add_event(fid, "entry-runway", start + datetime.timedelta(minutes=5), adep, 500.0,
+                      osm_info("runway", rw, adep))                # runway crossed while taxiing: not the line-up
             add_event(fid, "entry-runway", takeoff - datetime.timedelta(minutes=1), adep, 500.0,
-                      json.dumps({"ref": rw, "aeroway": "runway", "airport": adep}))
+                      osm_info("runway", rw, adep))
         add_event(fid, "take-off", takeoff, adep, 600.0)
         add_event(fid, "first-xing-fl100", takeoff + datetime.timedelta(minutes=8), adep, 10000.0)
         add_event(fid, "top-of-climb", takeoff + datetime.timedelta(minutes=20), adep, 36000.0)
         add_event(fid, "landing", landing, ades, 300.0)
         if ades in RUNWAYS:
-            rw = "/".join(rnd.choice(RUNWAYS[ades]))
+            rw = "-".join(rnd.choice(RUNWAYS[ades]))
             add_event(fid, "exit-runway", landing + datetime.timedelta(minutes=1), ades, 300.0,
-                      json.dumps({"ref": rw, "aeroway": "runway", "airport": ades}))
+                      osm_info("runway", rw, ades))
+            add_event(fid, "exit-runway", landing + datetime.timedelta(minutes=3), ades, 300.0,
+                      osm_info("runway", rw, ades))                # runway crossed while taxiing: not the exit
             add_event(fid, "entry-parking_position", landing + datetime.timedelta(minutes=6), ades, 300.0,
-                      json.dumps({"ref": "B7", "aeroway": "parking_position", "airport": ades}))
+                      osm_info("parking_position", "B7", ades))
 
     # 1) Valid flights in scope (first_seen between June 9 and June 17, landing before June 19)
     t0 = datetime.datetime(2026, 6, 9, 5, 0)
