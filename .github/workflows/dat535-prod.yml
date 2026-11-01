@@ -1,61 +1,100 @@
-name: DAT535 — Production Pipeline
+name: DAT535 — Production Pipeline (OPDI project)
+
+# Prod = the trusted version: runs after a merge into `main` (and once a month), only after a reviewer
+# approves the deployment (GitHub environment `main`), on the full scope in ~/opdi-data.
 
 on:
   push:
     branches: [main]
+    paths: ["projet_opdi/**", ".github/workflows/dat535-prod.yml"]
+  schedule:
+    - cron: "0 3 1 * *"            # monthly, 1st of the month at 03:00 UTC (rebuild and re-validation)
   workflow_dispatch:
     inputs:
-      lab:
-        description: Lab to run
-        required: true
-        default: all
-        type: choice
-        options: [all, lab2, lab3]
+      start:
+        description: "First day of the scope (YYYY-MM-DD, empty = 2026-06-01)"
+        required: false
+      end:
+        description: "End of the scope, exclusive (YYYY-MM-DD, empty = 2026-07-29)"
+        required: false
+
+concurrency:                       # never two prod runs at the same time on the same data
+  group: dat535-prod
+  cancel-in-progress: false
 
 jobs:
-  deploy-prod:
-    name: Deploy to Production
-    runs-on: self-hosted
-    environment: main
-    env:
-      DAT535_ENV: prod
-      SPARK_HOME: /opt/spark
-      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
-
+  tests:
+    name: Unit and end-to-end tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: projet_opdi
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Resolve output directory
-        id: output-dir
-        # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
-        run: echo "dir=$HOME/spark-lab-data/prod" >> "$GITHUB_OUTPUT"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: projet_opdi/requirements-test.txt
 
-      - name: Run Production Pipeline
-        env:
-          DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
+      - name: Set up Java (Spark 3.5)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Run tests
+        run: python -m pytest -v
+
+  pipeline-prod:
+    name: Deploy to production (full scope)
+    needs: tests
+    runs-on: self-hosted
+    environment: main              # required reviewer: the run waits for a manual approval
+    timeout-minutes: 360
+    env:
+      SPARK_HOME: /opt/spark
+      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Resolve folders
+        id: dirs
+        run: |
+          echo "data=$HOME/opdi-data" >> "$GITHUB_OUTPUT"
+          echo "report=$HOME/opdi-data/reports/run-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Check notebook runner dependencies
         run: |
           source ~/spark-env/bin/activate
-          mkdir -p "$DAT535_OUTPUT_DIR"
-          
-          LAB_TO_RUN="${{ github.event.inputs.lab || 'all' }}"
-          echo "=== Running Production Pipeline ($LAB_TO_RUN) ==="
-          python $GITHUB_WORKSPACE/run_pipeline.py $LAB_TO_RUN
+          python -c "import nbclient, nbconvert, ipykernel, findspark" 2>/dev/null \
+            || pip install --quiet nbclient nbconvert ipykernel findspark
 
-      - name: Upload Production artifacts
+      - name: Run the pipeline notebook (prod)
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_project.py --env prod \
+            ${{ github.event.inputs.start && format('--start {0}', github.event.inputs.start) || '' }} \
+            ${{ github.event.inputs.end && format('--end {0}', github.event.inputs.end) || '' }} \
+            --report-dir "${{ steps.dirs.outputs.report }}"
+
+      - name: Upload run report and quality results
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prod-outputs-${{ github.run_number }}
-          path: ${{ steps.output-dir.outputs.dir }}/
+          name: opdi-prod-run-${{ github.run_number }}
+          path: |
+            ${{ steps.dirs.outputs.report }}/
+            ${{ steps.dirs.outputs.data }}/pipeline_summary.json
+            ${{ steps.dirs.outputs.data }}/raw/manifest.csv
+            ${{ steps.dirs.outputs.data }}/raw/schema_report.csv
           retention-days: 30
-          if-no-files-found: ignore
-
-      - name: Write pipeline summary
-        run: |
-          echo "## Production Pipeline Run" >> $GITHUB_STEP_SUMMARY
-          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Run # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Lab | ${{ github.event.inputs.lab || 'all' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          if-no-files-found: warn
