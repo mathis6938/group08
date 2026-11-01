@@ -144,6 +144,25 @@ def test_published_tables_match_their_schema_contract(pipeline_run, spark):
 
 
 @pytest.mark.slow
+def test_explore_tool(pipeline_run):
+    """On-demand exploration of the arrival phase: runs on the published tables and finds the planted descents."""
+    data_root, env, _, _ = pipeline_run
+    code, out = run_cli("explore", {**env, "OPDI_RUN_ID": "test-explore"})
+    assert code == 0, out[-4000:]
+    r = report(data_root, "test-explore", "explore")
+    assert r["errors"] == {}, r["errors"]
+    assert {m["type"] for m in r["measurements"]["by_type"]} == {"Time passed (s)", "Distance flown (NM)"}
+    lfbo = next(c for c in r["milestones"]["coverage"] if c["dest_icao"] == "LFBO")
+    assert lfbo["pct_tod"] == 100.0 and lfbo["pct_rwy"] == 100.0
+    assert lfbo["med_tod_km"] == pytest.approx(150, abs=2) and lfbo["med_fl100_km"] == pytest.approx(50, abs=2)
+    lv = r["levels"]
+    assert lv["pct_paired_with_level_end"] == 100.0
+    assert lv["paired_duration_min"]["p50"] == pytest.approx(6.0)               # the planted holding patterns
+    assert lv["long_segment_ratio_flown_displacement"]["p50"] > 100            # flown 24 NM, displacement ~0
+    assert r["sequences"]["flights"]
+
+
+@pytest.mark.slow
 def test_rerun_is_idempotent(pipeline_run, spark):
     """A second run on the same data gives the same tables (no duplicates, nothing downloaded again)."""
     data_root, env, exp, _ = pipeline_run

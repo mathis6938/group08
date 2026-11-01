@@ -66,6 +66,7 @@ python projet_opdi/run_pipeline.py --env prod --layer silver      # une seule co
 python projet_opdi/run_pipeline.py --env prod --layer gold,summary
 python projet_opdi/run_pipeline.py --env prod --start 2026-06-01 --end 2026-06-11   # autre période
 python projet_opdi/run_pipeline.py --env prod --full-refresh      # reconstruit toutes les périodes du Bronze
+python projet_opdi/run_pipeline.py --env dev --layer explore     # à la demande : exploration de la phase d'arrivée
 python projet_opdi/run_pipeline.py --help
 ```
 
@@ -88,6 +89,10 @@ python projet_opdi/run_pipeline.py --help
   (taille ou `Last-Modified` différents). Le manifeste l'indique (`republished`), et le Bronze reconstruit
   seulement la période concernée, avec la traçabilité de la nouvelle version. Les référentiels OurAirports, mis
   à jour quotidiennement, sont ainsi rafraîchis à chaque changement.
+- Exploration (`--layer explore`, jamais incluse dans `all`) : vérifie sur les tables publiées les hypothèses de
+  l'étude de l'efficacité des arrivées (types et unités de `measurements`, jalons de descente et leur couverture
+  par aéroport, appariement des paliers après le début de descente, signature des circuits d'attente) et écrit
+  `reports/<run id>/explore.json`. Dans GitHub Actions : *Run workflow* sur le workflow dev, case `explore`.
 - Paramètres : `config/<env>.toml`. Les variables d'environnement `OPDI_START`, `OPDI_END`, `OPDI_DATA_ROOT`,
   `OPDI_RUN_ID`, `OPDI_FULL_REFRESH` (et `OPDI_BASE_URL`, `OPDI_AIRPORTS_URL`, `OPDI_RUNWAYS_URL` pour les tests) les remplacent, et
   les arguments de la ligne de commande remplacent les variables.
@@ -116,7 +121,7 @@ python -m pytest -v -m "not slow"        # sans les tests de bout en bout
 
 | Workflow | Déclencheur | Jobs |
 |---|---|---|
-| [`dat535-dev.yml`](../.github/workflows/dat535-dev.yml) | push sur `dev`, pull request vers `dev` ou `main`, **chaque nuit** (02:17 UTC), manuel | **tests** (runner GitHub) → **pipeline-dev** (runner de la VM, environnement `dev`, échantillon dans `~/opdi-data-dev`) |
+| [`dat535-dev.yml`](../.github/workflows/dat535-dev.yml) | push sur `dev`, pull request vers `dev` ou `main`, **chaque nuit** (02:17 UTC), manuel (case `explore` : exploration seule) | **tests** (runner GitHub) → **pipeline-dev** (runner de la VM, environnement `dev`, échantillon dans `~/opdi-data-dev`) |
 | [`dat535-prod.yml`](../.github/workflows/dat535-prod.yml) | push sur `main` (merge), **le 1er de chaque mois**, manuel | **tests** → **pipeline-prod** (runner de la VM, environnement `main` : **approbation manuelle**, périmètre complet dans `~/opdi-data`) |
 | [`labs.yml`](../.github/workflows/labs.yml) | manuel | pipelines des labs 2 et 3 |
 

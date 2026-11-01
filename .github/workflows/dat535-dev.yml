@@ -26,6 +26,10 @@ on:
         description: "Rebuild every Bronze period, even the ones whose source file did not change"
         type: boolean
         default: false
+      explore:
+        description: "Only run the exploration of the arrival phase on the published dev tables (no pipeline run)"
+        type: boolean
+        default: false
 
 concurrency:                       # a new push cancels the dev run still in progress for the same branch
   group: dat535-dev-${{ github.ref }}
@@ -34,6 +38,7 @@ concurrency:                       # a new push cancels the dev run still in pro
 jobs:
   tests:
     name: Unit and end-to-end tests
+    if: ${{ !inputs.explore }}
     runs-on: ubuntu-latest         # GitHub-hosted: does not use the VM, works even when it is busy
     timeout-minutes: 30
     defaults:
@@ -64,6 +69,7 @@ jobs:
 
   pipeline-dev:
     name: Run pipeline on the dev sample
+    if: ${{ !inputs.explore }}
     needs: tests
     runs-on: self-hosted
     environment: dev
@@ -127,5 +133,44 @@ jobs:
             ${{ env.DATA }}/raw/manifest.csv
             ${{ env.DATA }}/raw/schema_report.csv
             ${{ env.DATA }}/gold/
+          retention-days: 7
+          if-no-files-found: warn
+
+  explore:
+    name: Explore the arrival phase (on demand)
+    if: ${{ inputs.explore }}      # Run workflow -> tick "explore": reads the tables of the last dev run
+    runs-on: self-hosted
+    environment: dev
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      SPARK_HOME: /opt/spark
+      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      OPDI_RUN_ID: explore-${{ github.run_number }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Prepare folders
+        run: |
+          echo "DATA=$HOME/opdi-data-dev" >> "$GITHUB_ENV"
+          echo "LOGS=$HOME/opdi-data-dev/logs/$OPDI_RUN_ID" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/opdi-data-dev/logs/$OPDI_RUN_ID"
+
+      - name: Explore measurements, descent milestones, level segments
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env dev --layer explore 2>&1 | tee "$LOGS/explore.log"
+
+      - name: Upload the exploration report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: opdi-dev-explore-${{ github.run_number }}
+          path: |
+            ${{ env.LOGS }}/
+            ${{ env.DATA }}/reports/${{ env.OPDI_RUN_ID }}/
           retention-days: 7
           if-no-files-found: warn
