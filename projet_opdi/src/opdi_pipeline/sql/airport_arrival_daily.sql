@@ -34,10 +34,10 @@ WITH matched_arrivals AS (
 filtered_arrivals AS (
     SELECT m.*
     FROM matched_arrivals m
-    LEFT JOIN hourly_completeness c
-           ON m.arrival_date = c.movement_date
-          AND m.arrival_hour = c.movement_hour
-    WHERE COALESCE(c.is_complete_hour, true) = true
+    JOIN hourly_completeness c
+      ON m.arrival_date = c.movement_date
+     AND m.arrival_hour = c.movement_hour
+   WHERE c.is_complete_hour = true
 ),
 daily_aggs AS (
     SELECT dest_icao AS airport_icao,

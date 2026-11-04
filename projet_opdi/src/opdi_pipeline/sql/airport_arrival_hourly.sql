@@ -45,7 +45,7 @@ SELECT h.airport_icao,
        h.avg_additional_min,
        h.avg_level_minutes,
        h.holdings,
-       COALESCE(c.is_complete_hour, true) AS is_complete_hour,
+       COALESCE(c.is_complete_hour, false) AS is_complete_hour,
        current_timestamp()                AS _gold_built_at_utc
 FROM hourly_aggs h
 LEFT JOIN hourly_completeness c
