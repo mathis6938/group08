@@ -344,6 +344,12 @@ def run(spark, settings):
         write_table(events_quarantine, q / "flight_events", ["_source_period"])
     quar_schemas = {"flights": flights_quarantine.schema, "flight_events": events_quarantine.schema}
     flights_flagged.unpersist()
+
+    with steps.step("arrivals"):
+        from . import arrivals
+        arr_stats = arrivals.run(spark, settings, silver_flights, silver_events, airports)
+        steps.durations.update({f"arrivals: {k}": v for k, v in arr_stats.pop("durations_s", {}).items()})
+
     log.info("Silver: %.2f GB | quarantine: %.3f GB | free space left: %.1f GB",
              parquet_gb(s), parquet_gb(q), free_gb(settings.data_root))
 
@@ -355,8 +361,9 @@ def run(spark, settings):
         for p in problems:
             log.error("  schema of silver/%s: %s", t, p)
     report = write_report(settings, "silver", dict(
-        flight_outcomes=outcomes, **ev, schema_problems=schema_problems, size_gb=round(parquet_gb(s), 3),
-        quarantine_size_gb=round(parquet_gb(q), 3), durations_s=steps.durations))
+        flight_outcomes=outcomes, **ev, arrivals=arr_stats, schema_problems=schema_problems,
+        size_gb=round(parquet_gb(s), 3), quarantine_size_gb=round(parquet_gb(q), 3),
+        durations_s=steps.durations))
     if not ev["accounting_consistent"]:
         raise QualityGateError("Silver row accounting inconsistent (negative number of duplicates)")
     if ev["orphan_events"]:
