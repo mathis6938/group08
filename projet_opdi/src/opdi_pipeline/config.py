@@ -21,6 +21,25 @@ ENV_VARS = {
 
 
 @dataclass(frozen=True)
+class ArrivalsSettings:
+    """Thresholds and coefficients of the arrival-efficiency study."""
+    ring_radius_nm: float = 100.0
+    descent_radius_nm: float = 200.0
+    level_merge_max_gap_s: float = 60.0
+    level_merge_max_alt_diff_ft: float = 200.0
+    level_min_duration_s: float = 30.0
+    min_ground_clearance_ft: float = 1000.0
+    holding_min_duration_min: float = 4.0
+    holding_flown_displacement_ratio: float = 1.5
+    min_transit_min: float = 5.0
+    max_transit_min: float = 120.0
+    min_group_flights: int = 20
+    ref_percentile: float = 0.20
+    fuel_kg_per_level_min: float = 25.0
+    co2_factor: float = 3.16
+
+
+@dataclass(frozen=True)
 class Settings:
     env: str
     start: datetime.date            # inclusive
@@ -39,6 +58,7 @@ class Settings:
     shuffle_partitions: int
     run_id: str                     # shared by all the layers of one run (reports/<run_id>/)
     full_refresh: bool = False      # rebuild every Bronze period, even if its source file did not change
+    arrivals: ArrivalsSettings = ArrivalsSettings()
 
     @property
     def raw_dir(self):
@@ -99,6 +119,24 @@ def load_settings(env="prod", **overrides):
     values.update({k: v for k, v in overrides.items() if v not in (None, "")})
     values.setdefault("run_id", datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
 
+    arr_cfg = cfg.get("arrivals", {})
+    arrivals = ArrivalsSettings(
+        ring_radius_nm=float(arr_cfg.get("ring_radius_nm", 100.0)),
+        descent_radius_nm=float(arr_cfg.get("descent_radius_nm", 200.0)),
+        level_merge_max_gap_s=float(arr_cfg.get("level_merge_max_gap_s", 60.0)),
+        level_merge_max_alt_diff_ft=float(arr_cfg.get("level_merge_max_alt_diff_ft", 200.0)),
+        level_min_duration_s=float(arr_cfg.get("level_min_duration_s", 30.0)),
+        min_ground_clearance_ft=float(arr_cfg.get("min_ground_clearance_ft", 1000.0)),
+        holding_min_duration_min=float(arr_cfg.get("holding_min_duration_min", 4.0)),
+        holding_flown_displacement_ratio=float(arr_cfg.get("holding_flown_displacement_ratio", 1.5)),
+        min_transit_min=float(arr_cfg.get("min_transit_min", 5.0)),
+        max_transit_min=float(arr_cfg.get("max_transit_min", 120.0)),
+        min_group_flights=int(arr_cfg.get("min_group_flights", 20)),
+        ref_percentile=float(arr_cfg.get("ref_percentile", 0.20)),
+        fuel_kg_per_level_min=float(arr_cfg.get("fuel_kg_per_level_min", 25.0)),
+        co2_factor=float(arr_cfg.get("co2_factor", 3.16)),
+    )
+
     settings = Settings(
         env=env, start=_date(values["start"]), end=_date(values["end"]),
         data_root=Path(str(values["data_root"])).expanduser(),
@@ -106,7 +144,8 @@ def load_settings(env="prod", **overrides):
         origin=_date(values["origin"]), min_free_gb=float(values["min_free_gb"]), retries=int(values["retries"]),
         pause_s=float(values["pause_s"]), user_agent=values["user_agent"], app_name=values["app_name"],
         driver_memory=str(values["driver_memory"]), shuffle_partitions=int(values["shuffle_partitions"]),
-        run_id=str(values["run_id"]), full_refresh=_bool(values.get("full_refresh", False)))
+        run_id=str(values["run_id"]), full_refresh=_bool(values.get("full_refresh", False)),
+        arrivals=arrivals)
     if settings.start >= settings.end:
         raise ValueError(f"empty scope: start {settings.start} must be before end {settings.end}")
     return settings
