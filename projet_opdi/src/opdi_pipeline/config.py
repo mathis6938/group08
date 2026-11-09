@@ -40,6 +40,19 @@ class ArrivalsSettings:
 
 
 @dataclass(frozen=True)
+class MLSettings:
+    """Hyperparameters and configuration of the machine learning layer."""
+    test_days: int = 14
+    min_arrivals: int = 50
+    k_min: int = 3
+    k_max: int = 6
+    seed: int = 42
+    max_iter: int = 20
+    max_depth: int = 5
+    demand_cap_pctl: float = 0.90
+
+
+@dataclass(frozen=True)
 class Settings:
     env: str
     start: datetime.date            # inclusive
@@ -59,6 +72,7 @@ class Settings:
     run_id: str                     # shared by all the layers of one run (reports/<run_id>/)
     full_refresh: bool = False      # rebuild every Bronze period, even if its source file did not change
     arrivals: ArrivalsSettings = ArrivalsSettings()
+    ml: MLSettings = MLSettings()
 
     @property
     def raw_dir(self):
@@ -79,6 +93,10 @@ class Settings:
     @property
     def gold_dir(self):
         return self.data_root / "gold"
+
+    @property
+    def models_dir(self):
+        return self.data_root / "models"
 
     @property
     def report_dir(self):
@@ -137,6 +155,18 @@ def load_settings(env="prod", **overrides):
         co2_factor=float(arr_cfg.get("co2_factor", 3.16)),
     )
 
+    ml_cfg = cfg.get("ml", {})
+    ml = MLSettings(
+        test_days=int(ml_cfg.get("test_days", 14)),
+        min_arrivals=int(ml_cfg.get("min_arrivals", 50)),
+        k_min=int(ml_cfg.get("k_min", 3)),
+        k_max=int(ml_cfg.get("k_max", 6)),
+        seed=int(ml_cfg.get("seed", 42)),
+        max_iter=int(ml_cfg.get("max_iter", 20)),
+        max_depth=int(ml_cfg.get("max_depth", 5)),
+        demand_cap_pctl=float(ml_cfg.get("demand_cap_pctl", 0.90)),
+    )
+
     settings = Settings(
         env=env, start=_date(values["start"]), end=_date(values["end"]),
         data_root=Path(str(values["data_root"])).expanduser(),
@@ -145,7 +175,7 @@ def load_settings(env="prod", **overrides):
         pause_s=float(values["pause_s"]), user_agent=values["user_agent"], app_name=values["app_name"],
         driver_memory=str(values["driver_memory"]), shuffle_partitions=int(values["shuffle_partitions"]),
         run_id=str(values["run_id"]), full_refresh=_bool(values.get("full_refresh", False)),
-        arrivals=arrivals)
+        arrivals=arrivals, ml=ml)
     if settings.start >= settings.end:
         raise ValueError(f"empty scope: start {settings.start} must be before end {settings.end}")
     return settings

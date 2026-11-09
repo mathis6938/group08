@@ -23,5 +23,5 @@ if findspark is not None:
         import warnings
         warnings.warn(f"findspark could not locate Spark ({e}); using the installed pyspark package")
 
-LAYERS = ("ingest", "bronze", "silver", "gold", "summary")
+LAYERS = ("ingest", "bronze", "silver", "gold", "ml", "summary")
 TOOLS = ("explore",)            # run on demand only (--layer explore), never part of "all"

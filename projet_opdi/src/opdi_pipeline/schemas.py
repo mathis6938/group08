@@ -110,6 +110,19 @@ GOLD = {
         "airport_icao": "string", "lat_cell": "double", "lon_cell": "double",
         "altitude_band": "string", "holdings": "bigint", "holding_minutes": "double",
         "_gold_built_at_utc": "timestamp"},
+    "ml_feature_importance": {
+        "variable": "string", "importance": "double", "rank": "int",
+        "_ml_built_at_utc": "timestamp"},
+    "ml_scenarios": {
+        "airport_icao": "string", "scenario": "string", "demand_cap": "bigint",
+        "predicted_total_min_before": "double", "predicted_total_min_after": "double",
+        "saving_min_per_day": "double", "_ml_built_at_utc": "timestamp"},
+    "airport_typology": {
+        "airport_icao": "string", "airport_name": "string", "cluster": "int",
+        "cluster_label": "string", "avg_daily_arrivals": "double",
+        "avg_additional_min": "double", "p90_additional_min": "double",
+        "avg_level_minutes": "double", "pct_with_holding": "double",
+        "day_to_day_std": "double", "_ml_built_at_utc": "timestamp"},
 }
 
 

@@ -28,6 +28,7 @@ def test_published_tables_have_a_contract():
     assert set(schemas.GOLD) == {
         "airport_hourly_ops", "airport_daily_ops", "runway_usage", "airport_ground_times",
         "arrival_reference", "airport_arrival_daily", "airport_arrival_hourly", "holding_hotspots",
+        "ml_feature_importance", "ml_scenarios", "airport_typology",
     }
 
 

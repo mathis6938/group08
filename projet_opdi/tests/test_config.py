@@ -13,6 +13,7 @@ def test_dev_and_prod_are_separated():
     assert dev.data_root != prod.data_root                         # a dev run never touches prod data
     assert prod.bronze_dir == prod.data_root / "bronze"
     assert dev.ref_urls["airports.csv"].endswith("airports.csv")
+    assert dev.ml.test_days == 3 and prod.ml.test_days == 14
 
 
 def test_overrides_precedence(monkeypatch, tmp_path):
