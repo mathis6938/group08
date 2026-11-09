@@ -354,12 +354,12 @@ def build_airport_typology(spark, settings, daily_ops_df, airports_dim_df):
         daily_ops_df
         .groupBy("airport_icao")
         .agg(
-            F.sum("arrivals").alias("total_arrivals"),
-            F.round(F.avg("arrivals"), 2).alias("avg_daily_arrivals"),
-            F.round(F.avg("avg_additional_min"), 2).alias("avg_additional_min"),
-            F.round(F.percentile_approx("avg_additional_min", 0.90, 100), 2).alias("p90_additional_min"),
-            F.round(F.avg("avg_level_minutes"), 2).alias("avg_level_minutes"),
-            F.round(F.avg("pct_with_holding"), 2).alias("pct_with_holding"),
+            F.coalesce(F.sum("arrivals"), F.lit(0)).alias("total_arrivals"),
+            F.coalesce(F.round(F.avg("arrivals"), 2), F.lit(0.0)).alias("avg_daily_arrivals"),
+            F.coalesce(F.round(F.avg("avg_additional_min"), 2), F.lit(0.0)).alias("avg_additional_min"),
+            F.coalesce(F.round(F.percentile_approx("avg_additional_min", 0.90, 100), 2), F.lit(0.0)).alias("p90_additional_min"),
+            F.coalesce(F.round(F.avg("avg_level_minutes"), 2), F.lit(0.0)).alias("avg_level_minutes"),
+            F.coalesce(F.round(F.avg("pct_with_holding"), 2), F.lit(0.0)).alias("pct_with_holding"),
             F.coalesce(F.round(F.stddev("arrivals"), 2), F.lit(0.0)).alias("day_to_day_std"),
         )
     )
@@ -393,10 +393,11 @@ def build_airport_typology(spark, settings, daily_ops_df, airports_dim_df):
         "avg_daily_arrivals", "avg_additional_min", "p90_additional_min",
         "avg_level_minutes", "pct_with_holding", "day_to_day_std",
     ]
-    assembler = VectorAssembler(inputCols=feature_cols, outputCol="raw_features")
+    assembler = VectorAssembler(inputCols=feature_cols, outputCol="raw_features", handleInvalid="keep")
     scaler = StandardScaler(inputCol="raw_features", outputCol="features", withMean=True, withStd=True)
 
-    prepared = scaler.fit(assembler.transform(filtered)).transform(assembler.transform(filtered)).persist()
+    assembled = assembler.transform(filtered)
+    prepared = scaler.fit(assembled).transform(assembled).persist()
 
     evaluator = ClusteringEvaluator(featuresCol="features", metricName="silhouette")
     max_k_possible = min(settings.ml.k_max, max(2, n_airports - 1))
