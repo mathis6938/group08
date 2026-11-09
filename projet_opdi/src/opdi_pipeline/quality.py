@@ -7,9 +7,11 @@ from .common import free_gb, log, parquet_gb, read_report, table_rows, utc_now, 
 
 LAYER_TABLES = [
     ("Bronze", "bronze_dir", ["flight_list", "flight_events", "measurements", "airports", "runways"]),
-    ("Silver", "silver_dir", ["flights", "flight_events", "airports", "runways"]),
+    ("Silver", "silver_dir", ["flights", "flight_events", "airports", "runways", "arrivals", "descent_level_offs"]),
     ("Quarantine", "quarantine_dir", ["flights", "flight_events"]),
-    ("Gold", "gold_dir", ["airport_hourly_ops", "airport_daily_ops", "runway_usage", "airport_ground_times"]),
+    ("Gold", "gold_dir", ["airport_hourly_ops", "airport_daily_ops", "runway_usage", "airport_ground_times",
+                          "arrival_reference", "airport_arrival_daily", "airport_arrival_hourly", "holding_hotspots",
+                          "ml_feature_importance", "ml_scenarios", "airport_typology"]),
 ]
 
 
@@ -38,11 +40,23 @@ def run(spark, settings):
     for t in tables:
         log.info("%-11s %-22s %14s %10.3f", t["layer"], t["table"], f"{t['rows']:,}", t["size_gb"])
 
-    reports = {layer: read_report(settings, layer) for layer in ("ingest", "bronze", "silver", "gold")}
+    reports = {layer: read_report(settings, layer) for layer in ("ingest", "bronze", "silver", "gold", "ml")}
     durations = {f"{layer}: {step}": seconds for layer, r in reports.items() if r
                  for step, seconds in r.get("durations_s", {}).items()}
     slowest = sorted(durations.items(), key=lambda kv: kv[1], reverse=True)[:5]
     log.info("Slowest steps of the run: %s", slowest)
+
+    gold = reports["gold"] or {}
+    incomplete_hours = gold.get("incomplete_hours", [])
+    if incomplete_hours:
+        log.warning("WARNING: %d incomplete hours detected in European traffic: %s",
+                    len(incomplete_hours), incomplete_hours)
+
+    ml = reports.get("ml") or {}
+    ml_warning = None
+    if ml and not ml.get("beats_baseline", True):
+        ml_warning = f"GBT model did not beat baseline (MAE: {ml.get('model_mae', 0):.2f} vs {ml.get('baseline_mae', 0):.2f})"
+        log.warning("WARNING: %s; ML tables not published", ml_warning)
 
     gate_results = gates(settings)
     for name, ok in gate_results.items():
@@ -55,6 +69,7 @@ def run(spark, settings):
                    generated_at_utc=utc_now().isoformat(timespec="seconds"), scope_start=str(settings.start),
                    scope_end=str(settings.end), data_root=str(settings.data_root), gates=gate_results,
                    tables=tables, quarantine_reasons=silver.get("quarantine_reasons", {}),
+                   incomplete_hours=incomplete_hours, ml_warning=ml_warning,
                    step_durations_s=durations, free_disk_gb=round(free_gb(settings.data_root), 1))
     (settings.data_root / "pipeline_summary.json").write_text(json.dumps(summary, indent=2))
     write_report(settings, "summary", summary)
@@ -74,6 +89,16 @@ def write_github_summary(s):
     lines += [f"| {name} | {'✅' if ok else '❌'} |" for name, ok in s["gates"].items()]
     lines += ["", "### Tables", "", "| Layer | Table | Rows | Size (GB) |", "|---|---|---:|---:|"]
     lines += [f"| {t['layer']} | {t['table']} | {t['rows']:,} | {t['size_gb']:.3f} |" for t in s["tables"]]
+    if s.get("incomplete_hours"):
+        lines += ["", "### Data regularity warnings", "",
+                  f"⚠️ **{len(s['incomplete_hours'])} incomplete hours detected** (European traffic < 50% of period median):", ""]
+        lines += [f"- `{h['movement_date']} {h['movement_hour']:02d}:00` (traffic: {h['total_euro_traffic']:,} vs median: {h['median_euro_traffic']:,})"
+                  for h in s["incomplete_hours"][:10]]
+        if len(s["incomplete_hours"]) > 10:
+            lines += [f"- ... and {len(s['incomplete_hours']) - 10} more hours"]
+    if s.get("ml_warning"):
+        lines += ["", "### Machine learning warning", "",
+                  f"⚠️ **{s['ml_warning']}** (tables and model not published)"]
     if s.get("quarantine_reasons"):
         lines += ["", "### Quarantine reasons", "", "| Table | Reason | Rows |", "|---|---|---:|"]
         lines += [f"| {table} | {reason} | {n:,} |"

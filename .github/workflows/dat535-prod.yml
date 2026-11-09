@@ -83,31 +83,36 @@ jobs:
           echo "LOGS=$HOME/opdi-data/logs/$OPDI_RUN_ID" >> "$GITHUB_ENV"
           mkdir -p "$HOME/opdi-data/logs/$OPDI_RUN_ID"
 
-      - name: "1/5 Ingest: download the OPDI and OurAirports files (raw/, manifest)"
+      - name: "1/6 Ingest: download the OPDI and OurAirports files (raw/, manifest)"
         run: |
           source ~/spark-env/bin/activate
           python projet_opdi/run_pipeline.py --env prod --layer ingest 2>&1 | tee "$LOGS/1_ingest.log"
 
-      - name: "2/5 Bronze: schema check, tables with lineage, reconciliation"
+      - name: "2/6 Bronze: schema check, tables with lineage, reconciliation"
         run: |
           source ~/spark-env/bin/activate
           python projet_opdi/run_pipeline.py --env prod --layer bronze 2>&1 | tee "$LOGS/2_bronze.log"
 
-      - name: "3/5 Silver: cleaning, quarantine, deduplication, enrichment, evidence"
+      - name: "3/6 Silver: cleaning, quarantine, deduplication, enrichment, evidence"
         run: |
           source ~/spark-env/bin/activate
           python projet_opdi/run_pipeline.py --env prod --layer silver 2>&1 | tee "$LOGS/3_silver.log"
 
-      - name: "4/5 Gold: airport operations, validation, publication"
+      - name: "4/6 Gold: airport operations, validation, publication"
         run: |
           source ~/spark-env/bin/activate
           python projet_opdi/run_pipeline.py --env prod --layer gold 2>&1 | tee "$LOGS/4_gold.log"
 
-      - name: "5/5 Summary: quality gates of the run"
+      - name: "5/6 ML: GBT arrival model, scenarios, airport typology"
+        run: |
+          source ~/spark-env/bin/activate
+          python projet_opdi/run_pipeline.py --env prod --layer ml 2>&1 | tee "$LOGS/5_ml.log"
+
+      - name: "6/6 Summary: quality gates of the run"
         if: always()               # also after a failure: the summary shows which gate failed
         run: |
           source ~/spark-env/bin/activate
-          python projet_opdi/run_pipeline.py --env prod --layer summary 2>&1 | tee "$LOGS/5_summary.log"
+          python projet_opdi/run_pipeline.py --env prod --layer summary 2>&1 | tee "$LOGS/6_summary.log"
 
       # Gold tables: a few MB, so they can be analysed without access to the VM
       - name: Upload logs, layer reports, quality results and Gold tables

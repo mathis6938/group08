@@ -55,7 +55,7 @@ def pipeline_run(tmp_path_factory, site):
            "OPDI_RUNWAYS_URL": f"{url}/ourairports/runways.csv",
            "PYSPARK_PYTHON": sys.executable}
     logs = {}
-    for layer in ("ingest", "bronze", "silver", "gold", "summary"):     # one process per layer, as in the CI
+    for layer in ("ingest", "bronze", "silver", "gold", "ml", "summary"):     # one process per layer, as in the CI
         code, logs[layer] = run_cli(layer, env)
         assert code == 0, f"layer {layer} failed:\n{logs[layer][-4000:]}"
     yield data_root, env, expected, logs
@@ -69,7 +69,7 @@ def read(spark, path):
 @pytest.mark.slow
 def test_pipeline_runs_and_publishes(pipeline_run):
     data_root, _, _, logs = pipeline_run
-    for layer in ("ingest", "bronze", "silver", "gold", "summary"):
+    for layer in ("ingest", "bronze", "silver", "gold", "ml", "summary"):
         assert (data_root / "reports" / RUN_ID / f"{layer}.json").exists()
     assert "END-TO-END PIPELINE: PASSED" in logs["summary"]
     summary = json.loads((data_root / "pipeline_summary.json").read_text())
@@ -113,6 +113,23 @@ def test_silver_finds_the_planted_defects(pipeline_run, spark):
     assert silver_ev.join(silver_fl, "flight_id", "left_anti").count() == 0
     assert dict(silver_ev.dtypes)["event_timestamp_utc"] == "timestamp"
 
+    # Arrival efficiency Silver tables
+    arr = read(spark, data_root / "silver" / "arrivals")
+    assert arr.count() == exp["arrivals"]
+    assert arr.filter("is_transit_plausible").count() == exp["measured_arrivals"]
+    assert arr.filter("holding_count > 0").count() == exp["holdings"]
+    # Check that entry sector is assigned (due north in synthetic data)
+    assert arr.filter("entry_sector = 'N'").count() == exp["measured_arrivals"]
+
+    lev = read(spark, data_root / "silver" / "descent_level_offs")
+    assert lev.count() == exp["fused_level_offs"]
+    assert lev.filter("is_holding").count() == exp["holdings"]
+    # Ground levels (alt < 1500 ft) excluded
+    assert lev.filter("altitude_ft < 1500").count() == 0
+    # Chunked level segments fused
+    assert lev.filter("segments_merged > 1").count() == 20
+    assert lev.filter("segments_merged > 1").first()["segments_merged"] == 2
+
 
 @pytest.mark.slow
 def test_gold_figures(pipeline_run, spark):
@@ -131,6 +148,34 @@ def test_gold_figures(pipeline_run, spark):
     assert row["avg(avg_taxi_out_min)"] == pytest.approx(9.0)     # exit-parking -> runway line-up = 9 min
     assert row["avg(avg_taxi_in_min)"] == pytest.approx(5.0)      # runway exit -> entry-parking = 5 min
 
+    # Arrival efficiency Gold tables
+    arr_daily = read(spark, data_root / "gold" / "airport_arrival_daily")
+    assert arr_daily.count() > 0
+    assert arr_daily.filter("arrivals < arrivals_measured").count() == 0
+    assert arr_daily.filter("NOT pct_coverage BETWEEN 0 AND 100").count() == 0
+
+    arr_ref = read(spark, data_root / "gold" / "arrival_reference")
+    assert arr_ref.count() > 0
+    assert arr_ref.filter("ref_transit_min <= 0").count() == 0
+
+    hotspots = read(spark, data_root / "gold" / "holding_hotspots")
+    assert hotspots.count() > 0
+    assert hotspots.agg({"holdings": "sum"}).first()[0] == exp["holdings"]
+
+    # Check incomplete hours detection in gold report
+    gold_rep = report(data_root, RUN_ID, "gold")
+    assert any(h["movement_hour"] == 14 and "2026-06-09" in str(h["movement_date"])
+               for h in gold_rep.get("incomplete_hours", []))
+
+    # Check ML layer report and published tables
+    ml_rep = report(data_root, RUN_ID, "ml")
+    assert ml_rep["status"] in ("PASSED", "SKIPPED")
+    if ml_rep["status"] == "PASSED":
+        assert (data_root / "gold" / "ml_feature_importance").exists()
+        assert (data_root / "gold" / "ml_scenarios").exists()
+        assert (data_root / "gold" / "airport_typology").exists()
+        assert read(spark, data_root / "gold" / "airport_typology").count() > 0
+
 
 @pytest.mark.slow
 def test_published_tables_match_their_schema_contract(pipeline_run, spark):
@@ -141,6 +186,25 @@ def test_published_tables_match_their_schema_contract(pipeline_run, spark):
             assert schemas.compare(read(spark, data_root / layer / table).schema, contract) == [], (layer, table)
     gold = json.loads((data_root / "reports" / RUN_ID / "gold.json").read_text())
     assert all(v for k, v in gold["checks"].items() if "schema" in k)
+
+
+@pytest.mark.slow
+def test_explore_tool(pipeline_run):
+    """On-demand exploration of the arrival phase: runs on the published tables and finds the planted descents."""
+    data_root, env, _, _ = pipeline_run
+    code, out = run_cli("explore", {**env, "OPDI_RUN_ID": "test-explore"})
+    assert code == 0, out[-4000:]
+    r = report(data_root, "test-explore", "explore")
+    assert r["errors"] == {}, r["errors"]
+    assert {m["type"] for m in r["measurements"]["by_type"]} == {"Time Passed (s)", "Distance flown (NM)"}
+    lfbo = next(c for c in r["milestones"]["coverage"] if c["dest_icao"] == "LFBO")
+    assert lfbo["pct_tod"] == 100.0 and lfbo["pct_rwy"] == 100.0
+    assert lfbo["med_tod_km"] == pytest.approx(150, abs=2) and lfbo["med_fl100_km"] == pytest.approx(50, abs=2)
+    lv = r["levels"]
+    assert lv["pct_paired_with_level_end"] == 100.0
+    assert lv["paired_duration_min"]["p50"] == pytest.approx(6.0)               # the planted holding patterns
+    assert lv["long_segment_ratio_flown_displacement"]["p50"] > 100            # flown 24 NM, displacement ~0
+    assert r["sequences"]["flights"]
 
 
 @pytest.mark.slow

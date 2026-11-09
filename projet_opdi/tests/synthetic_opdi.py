@@ -60,13 +60,17 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
                     orphan_events=0, invalid_coordinate_events=0, duplicate_events=0, out_of_scope_events=0)
     event_id = [1000]
 
-    def add_event(fid, kind, t, apt, alt, info="nan"):
+    def add_event(fid, kind, t, apt, alt, info="nan", north_km=0.0, flown_nm=None):
+        """One event (position: the airport, moved `north_km` to the north) + its measurements."""
         event_id[0] += 1
         lat, lon = coords.get(apt, (50.0, 5.0))
-        events.append(dict(id=event_id[0], flight_id=fid, type=kind, event_time=ts(t), longitude=lon, latitude=lat,
-                           altitude=alt, source="OSN", version="v0.0.2", info=info))
-        measurements.append(dict(id=event_id[0] * 10, event_id=event_id[0], type="Time passed (s)",
+        events.append(dict(id=event_id[0], flight_id=fid, type=kind, event_time=ts(t), longitude=lon,
+                           latitude=lat + north_km / 111.2, altitude=alt, source="OSN", version="v0.0.2", info=info))
+        measurements.append(dict(id=event_id[0] * 10, event_id=event_id[0], type="Time Passed (s)",
                                  value=float(rnd.randint(0, 9000)), version="v0.0.2"))
+        if flown_nm is not None:
+            measurements.append(dict(id=event_id[0] * 10 + 1, event_id=event_id[0], type="Distance flown (NM)",
+                                     value=float(flown_nm), version="v0.0.2"))
         return event_id[0]
 
     def add_flight(fid, adep, ades, start, minutes, icao24=None, first_seen=None, ground_events=True):
@@ -79,7 +83,8 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
                             version="v0.0.2"))
         if not ground_events:
             return
-        takeoff, landing = start + datetime.timedelta(minutes=12), end - datetime.timedelta(minutes=10)
+        takeoff = start + datetime.timedelta(minutes=12)
+        landing = end - datetime.timedelta(minutes=10)
         if adep in RUNWAYS:
             rw = "/".join(rnd.choice(RUNWAYS[adep]))          # OSM references: "14L/32R" or "14L-32R"
             add_event(fid, "exit-parking_position", start + datetime.timedelta(minutes=2), adep, 500.0,
@@ -89,17 +94,63 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
             add_event(fid, "entry-runway", takeoff - datetime.timedelta(minutes=1), adep, 500.0,
                       osm_info("runway", rw, adep))
         add_event(fid, "take-off", takeoff, adep, 600.0)
-        add_event(fid, "first-xing-fl100", takeoff + datetime.timedelta(minutes=8), adep, 10000.0)
-        add_event(fid, "top-of-climb", takeoff + datetime.timedelta(minutes=20), adep, 36000.0)
+        add_event(fid, "first-xing-fl100", takeoff + datetime.timedelta(minutes=5), adep, 10000.0)
+        add_event(fid, "top-of-climb", takeoff + datetime.timedelta(minutes=10), adep, 36000.0)
+
+        # Cruise event outside 100 NM circle (240 km north) to test ring entry interpolation
+        add_event(fid, "first-xing-fl245", landing - datetime.timedelta(minutes=38), ades, 36000.0,
+                  north_km=240.0, flown_nm=950.0)
+
+        # Descent to destination:
+        holding = fid % 3 == 0
+        tod = landing - datetime.timedelta(minutes=31 if holding else 25)
+        add_event(fid, "top-of-descent", tod, ades, 36000.0, north_km=150.0, flown_nm=1000.0)
+
+        # Plant a fake top-of-descent on some flights at FL160 to verify that true descent start (FL360) is picked
+        if fid % 5 == 2:
+            add_event(fid, "top-of-descent", tod + datetime.timedelta(minutes=4), ades, 16000.0,
+                      north_km=70.0, flown_nm=1030.0)
+
+        if holding:
+            if fid % 15 == 0:
+                # 2 chunked segments of 10s and 345s (gap 5s <= 60s) at FL120: fused into 1 level of 6 min
+                add_event(fid, "level-start", tod + datetime.timedelta(minutes=5), ades, 12000.0, north_km=80.0,
+                          flown_nm=1037.5)
+                add_event(fid, "level-end", tod + datetime.timedelta(minutes=5, seconds=10), ades, 12000.0, north_km=80.0,
+                          flown_nm=1038.5)
+                add_event(fid, "level-start", tod + datetime.timedelta(minutes=5, seconds=15), ades, 12000.0, north_km=80.0,
+                          flown_nm=1039.0)
+                add_event(fid, "level-end", tod + datetime.timedelta(minutes=11), ades, 12000.0, north_km=80.0,
+                          flown_nm=1061.5)
+            else:
+                add_event(fid, "level-start", tod + datetime.timedelta(minutes=5), ades, 12000.0, north_km=80.0,
+                          flown_nm=1037.5)
+                add_event(fid, "level-end", tod + datetime.timedelta(minutes=11), ades, 12000.0, north_km=80.0,
+                          flown_nm=1061.5)
+
+        add_event(fid, "last-xing-fl100", landing - datetime.timedelta(minutes=12), ades, 10000.0, north_km=50.0,
+                  flown_nm=1000.0 + (24 if holding else 0) + 13 * 7.5)
+        if ades in RUNWAYS:
+            add_event(fid, "entry-runway", landing - datetime.timedelta(seconds=30), ades, 350.0,
+                      osm_info("runway", "-".join(RUNWAYS[ades][0]), ades),
+                      flown_nm=1000.0 + (24 if holding else 0) + 24.5 * 7.5)
         add_event(fid, "landing", landing, ades, 300.0)
         if ades in RUNWAYS:
             rw = "-".join(rnd.choice(RUNWAYS[ades]))
             add_event(fid, "exit-runway", landing + datetime.timedelta(minutes=1), ades, 300.0,
                       osm_info("runway", rw, ades))
+            # Runway crossed during rollout (after landing): must NOT be selected as landing entry
+            add_event(fid, "entry-runway", landing + datetime.timedelta(minutes=2), ades, 300.0,
+                      osm_info("runway", rw, ades))
             add_event(fid, "exit-runway", landing + datetime.timedelta(minutes=3), ades, 300.0,
-                      osm_info("runway", rw, ades))                # runway crossed while taxiing: not the exit
+                      osm_info("runway", rw, ades))
             add_event(fid, "entry-parking_position", landing + datetime.timedelta(minutes=6), ades, 300.0,
                       osm_info("parking_position", "B7", ades))
+
+        # Ground level segment while parked at destination (altitude 350 ft < elevation + 1000 ft): must be excluded
+        if fid % 50 == 0:
+            add_event(fid, "level-start", landing + datetime.timedelta(minutes=7), ades, 350.0, north_km=0.0)
+            add_event(fid, "level-end", landing + datetime.timedelta(minutes=9), ades, 350.0, north_km=0.0)
 
     # 1) Valid flights in scope (first_seen between June 9 and June 17, landing before June 19)
     t0 = datetime.datetime(2026, 6, 9, 5, 0)
@@ -108,7 +159,17 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
         if i % 10 == 0:
             adep = rnd.choice(["", None, "nan"])          # unknown departure airport: kept, flagged
         start = t0 + datetime.timedelta(minutes=rnd.randint(0, 8 * 24 * 60))
-        add_flight(i + 1, adep, ades, start, rnd.randint(60, 150))
+        duration = rnd.randint(75, 150)
+        # Plant an incomplete traffic hour on June 9 14:00 UTC by shifting any flight away so NO movement lands or takes off in hour 14
+        while True:
+            takeoff = start + datetime.timedelta(minutes=12)
+            landing = takeoff + datetime.timedelta(minutes=duration)
+            if (takeoff.date() == datetime.date(2026, 6, 9) and takeoff.hour == 14) or \
+               (landing.date() == datetime.date(2026, 6, 9) and landing.hour == 14):
+                start += datetime.timedelta(hours=2)
+            else:
+                break
+        add_flight(i + 1, adep, ades, start, duration)
         expected["valid_flights"] += 1
 
     # 2) Defective flights (-> quarantine) and flights out of scope (-> dropped)
@@ -147,6 +208,10 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
     expected["bronze_events"] = len(events)
     expected["valid_events"] = (len(events) - expected["orphan_events"] - expected["invalid_coordinate_events"]
                                 - expected["duplicate_events"] - expected["out_of_scope_events"])
+    expected["arrivals"] = expected["valid_flights"]
+    expected["measured_arrivals"] = expected["valid_flights"]
+    expected["holdings"] = sum(1 for i in range(n_flights) if (i + 1) % 3 == 0)
+    expected["fused_level_offs"] = expected["holdings"]
 
     # 5) Files with the EUROCONTROL names, under the same URL layout
     w = f"{START:%Y%m%d}_{END:%Y%m%d}"

@@ -4,6 +4,7 @@
     python projet_opdi/run_pipeline.py --env dev --layer silver           # one layer (inputs already on disk)
     python projet_opdi/run_pipeline.py --env prod --layer bronze,silver --start 2026-06-01 --end 2026-06-11
     python projet_opdi/run_pipeline.py --env prod --full-refresh           # rebuild all the Bronze periods
+    python projet_opdi/run_pipeline.py --env dev --layer explore           # on demand: arrival-phase data checks
 
 Exit code 1 if a layer fails (e.g. a quality gate): the next layers are not run, the summary is still written.
 """
@@ -12,24 +13,26 @@ import logging
 import sys
 import time
 
-from . import LAYERS
+from . import LAYERS, TOOLS
 from .common import QualityGateError, log
 from .config import load_settings
 
 
 def parse_layers(value):
+    known = LAYERS + TOOLS
     layers = list(LAYERS) if value == "all" else [v.strip() for v in value.split(",") if v.strip()]
-    unknown = [v for v in layers if v not in LAYERS]
+    unknown = [v for v in layers if v not in known]
     if unknown:
-        raise argparse.ArgumentTypeError(f"unknown layer(s) {unknown}; choose among {', '.join(LAYERS)} or all")
-    return sorted(layers, key=LAYERS.index)                     # always in pipeline order
+        raise argparse.ArgumentTypeError(f"unknown layer(s) {unknown}; choose among {', '.join(known)} or all")
+    return sorted(layers, key=known.index)                      # always in pipeline order
 
 
 def run_layer(layer, spark, settings):
-    from . import bronze, gold, ingestion, quality, silver
+    from . import bronze, explore, gold, ingestion, ml, quality, silver
     if layer == "ingest":
         return ingestion.run(settings)
-    return {"bronze": bronze, "silver": silver, "gold": gold, "summary": quality}[layer].run(spark, settings)
+    modules = {"bronze": bronze, "silver": silver, "gold": gold, "ml": ml, "summary": quality, "explore": explore}
+    return modules[layer].run(spark, settings)
 
 
 def main(argv=None):

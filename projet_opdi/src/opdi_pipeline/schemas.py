@@ -47,6 +47,23 @@ SILVER = {
         "airport_icao": "string", "le_ident": "string", "he_ident": "string", "length_ft": "double",
         "width_ft": "double", "surface": "string", "is_closed": "boolean", "le_heading_deg": "double",
         "he_heading_deg": "double"},
+    "arrivals": {
+        "flight_id": "bigint", "dest_icao": "string", "origin_icao": "string", "operator_icao": "string",
+        "aircraft_typecode": "string", "aircraft_class": "string", "ring_entry_utc": "timestamp",
+        "ring_entry_lat": "double", "ring_entry_lon": "double", "entry_sector": "string",
+        "landing_utc": "timestamp", "arrival_runway": "string", "transit_min": "double",
+        "is_transit_plausible": "boolean", "descent_start_utc": "timestamp", "level_off_count": "bigint",
+        "level_minutes": "double", "level_minutes_lt_fl70": "double", "level_minutes_fl70_100": "double",
+        "level_minutes_fl100_200": "double", "level_minutes_ge_fl200": "double", "holding_count": "bigint",
+        "holding_minutes": "double", "arrival_date": "date", "arrival_hour": "int",
+        "_silver_processed_at_utc": "timestamp", "_source_file": "string", "_ingestion_run_id": "string",
+        "_source_sha256": "string", "_source_period": "int"},
+    "descent_level_offs": {
+        "flight_id": "bigint", "dest_icao": "string", "start_utc": "timestamp", "end_utc": "timestamp",
+        "duration_min": "double", "altitude_ft": "double", "altitude_band": "string",
+        "start_lat": "double", "start_lon": "double", "end_lat": "double", "end_lon": "double",
+        "distance_flown_km": "double", "displacement_km": "double", "is_holding": "boolean",
+        "segments_merged": "bigint", "_silver_processed_at_utc": "timestamp"},
 }
 
 GOLD = {
@@ -71,6 +88,41 @@ GOLD = {
         "avg_taxi_in_min": "double", "median_taxi_in_min": "double", "p90_taxi_in_min": "double",
         "airport_name": "string", "iso_country": "string", "municipality": "string",
         "pct_taxi_out_coverage": "double", "pct_taxi_in_coverage": "double", "_gold_built_at_utc": "timestamp"},
+    "arrival_reference": {
+        "airport_icao": "string", "arrival_runway": "string", "aircraft_class": "string",
+        "entry_sector": "string", "fallback_level": "string", "n_flights": "bigint",
+        "ref_transit_min": "double", "_gold_built_at_utc": "timestamp"},
+    "airport_arrival_daily": {
+        "airport_icao": "string", "movement_date": "date", "arrivals": "bigint",
+        "arrivals_measured": "bigint", "pct_coverage": "double", "avg_additional_min": "double",
+        "median_additional_min": "double", "p90_additional_min": "double", "total_additional_min": "double",
+        "avg_level_offs": "double", "avg_level_minutes": "double", "level_minutes_lt_fl70": "double",
+        "level_minutes_fl70_100": "double", "level_minutes_fl100_200": "double",
+        "level_minutes_ge_fl200": "double", "pct_with_holding": "double", "holding_minutes": "double",
+        "est_fuel_kg": "double", "est_co2_kg": "double", "airport_name": "string",
+        "iso_country": "string", "municipality": "string", "_gold_built_at_utc": "timestamp"},
+    "airport_arrival_hourly": {
+        "airport_icao": "string", "movement_date": "date", "movement_hour": "int",
+        "arrivals": "bigint", "arrivals_measured": "bigint", "avg_additional_min": "double",
+        "avg_level_minutes": "double", "holdings": "bigint", "is_complete_hour": "boolean",
+        "_gold_built_at_utc": "timestamp"},
+    "holding_hotspots": {
+        "airport_icao": "string", "lat_cell": "double", "lon_cell": "double",
+        "altitude_band": "string", "holdings": "bigint", "holding_minutes": "double",
+        "_gold_built_at_utc": "timestamp"},
+    "ml_feature_importance": {
+        "variable": "string", "importance": "double", "rank": "int",
+        "_ml_built_at_utc": "timestamp"},
+    "ml_scenarios": {
+        "airport_icao": "string", "scenario": "string", "demand_cap": "bigint",
+        "predicted_total_min_before": "double", "predicted_total_min_after": "double",
+        "saving_min_per_day": "double", "_ml_built_at_utc": "timestamp"},
+    "airport_typology": {
+        "airport_icao": "string", "airport_name": "string", "cluster": "int",
+        "cluster_label": "string", "avg_daily_arrivals": "double",
+        "avg_additional_min": "double", "p90_additional_min": "double",
+        "avg_level_minutes": "double", "pct_with_holding": "double",
+        "day_to_day_std": "double", "_ml_built_at_utc": "timestamp"},
 }
 
 

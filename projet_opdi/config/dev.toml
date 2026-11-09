@@ -25,3 +25,31 @@ user_agent  = "UiS-DAT535-group08"
 app_name           = "DAT535-OPDI-dev"
 driver_memory      = "2g"
 shuffle_partitions = 8
+
+[arrivals]
+ring_radius_nm                   = 100.0   # 100 NM entry circle for arrival transit time (ASMA-like)
+descent_radius_nm                = 200.0   # 200 NM window to identify descent start
+level_merge_max_gap_s            = 60.0    # maximum gap between consecutive level chunks to merge (s)
+level_merge_max_alt_diff_ft      = 200.0   # maximum altitude difference between chunks to merge (ft)
+level_min_duration_s             = 30.0    # minimum duration for a merged level segment to be kept (s)
+min_ground_clearance_ft          = 1000.0  # filter out ground level segments (< elevation + 1000 ft)
+holding_min_duration_min         = 4.0     # minimum duration for a level segment to be candidate holding (min)
+holding_flown_displacement_ratio = 1.5     # distance flown / displacement ratio threshold for holding
+min_transit_min                  = 5.0     # plausible arrival transit minimum (min)
+max_transit_min                  = 120.0   # plausible arrival transit maximum (min)
+min_group_flights                = 20      # minimum group size before falling back to coarser group
+ref_percentile                   = 0.20    # 20th percentile for unconstrained reference transit time
+fuel_kg_per_level_min            = 25.0    # EUROCONTROL CDO benchmark: ~25 kg fuel / min level vs continuous descent
+co2_factor                       = 3.16    # ICAO standard conversion factor (kg CO2 / kg jet fuel)
+
+[ml]
+test_days        = 3       # test split size in days for dev (14 in prod)
+min_arrivals     = 20      # minimum measured arrivals for airport typology in dev (100 in prod)
+k_min            = 3       # minimum clusters for KMeans
+k_max            = 6       # maximum clusters for KMeans
+seed             = 42      # random seed for ML algorithms
+max_iter         = 20      # GBTRegressor iterations
+max_depth        = 5       # GBTRegressor tree depth
+demand_cap_pctl  = 0.90    # percentile threshold for demand capping scenario
+
+

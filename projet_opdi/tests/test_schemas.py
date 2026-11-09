@@ -23,8 +23,13 @@ def test_raw_contract_is_the_opdi_2026_schema():
 
 
 def test_published_tables_have_a_contract():
-    assert set(schemas.SILVER) == {"flights", "flight_events", "airports", "runways"}
-    assert set(schemas.GOLD) == {"airport_hourly_ops", "airport_daily_ops", "runway_usage", "airport_ground_times"}
+    # Schema contracts must cover all published Silver and Gold tables (including arrival efficiency)
+    assert set(schemas.SILVER) == {"flights", "flight_events", "airports", "runways", "arrivals", "descent_level_offs"}
+    assert set(schemas.GOLD) == {
+        "airport_hourly_ops", "airport_daily_ops", "runway_usage", "airport_ground_times",
+        "arrival_reference", "airport_arrival_daily", "airport_arrival_hourly", "holding_hotspots",
+        "ml_feature_importance", "ml_scenarios", "airport_typology",
+    }
 
 
 def test_schema_change_at_the_source_is_detected(spark, tmp_path):

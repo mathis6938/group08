@@ -6,6 +6,7 @@ Layers (one module each, run in this order):
     silver     standardisation, quality rules, quarantine, deduplication, enrichment (silver/, quarantine/)
     gold       airport traffic, runway usage, ground times, validation, publication (gold/)
     quality    end-to-end summary of the run and quality gates
+On demand: explore (checks of the arrival-phase data, reports/<run id>/explore.json).
 
 Command line: python projet_opdi/run_pipeline.py --env dev --layer all
 """
@@ -22,4 +23,5 @@ if findspark is not None:
         import warnings
         warnings.warn(f"findspark could not locate Spark ({e}); using the installed pyspark package")
 
-LAYERS = ("ingest", "bronze", "silver", "gold", "summary")
+LAYERS = ("ingest", "bronze", "silver", "gold", "ml", "summary")
+TOOLS = ("explore",)            # run on demand only (--layer explore), never part of "all"
