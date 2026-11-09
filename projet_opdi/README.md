@@ -99,6 +99,9 @@ python projet_opdi/run_pipeline.py --help
   l'étude de l'efficacité des arrivées (types et unités de `measurements`, jalons de descente et leur couverture
   par aéroport, appariement des paliers après le début de descente, signature des circuits d'attente) et écrit
   `reports/<run id>/explore.json`. Dans GitHub Actions : *Run workflow* sur le workflow dev, case `explore`.
+- Notebooks vitrine : *Run workflow* sur le workflow dev, case `notebooks`, exécute les notebooks 02, 04 et 05 sur les
+  tables **prod** (lecture seule) et publie en artefact les notebooks exécutés et les figures de `docs/figures/` :
+  pas besoin d'accéder au Jupyter de la VM, qui n'est joignable que depuis le réseau de l'université.
 - Paramètres : `config/<env>.toml`. Les variables d'environnement `OPDI_START`, `OPDI_END`, `OPDI_DATA_ROOT`,
   `OPDI_RUN_ID`, `OPDI_FULL_REFRESH` (et `OPDI_BASE_URL`, `OPDI_AIRPORTS_URL`, `OPDI_RUNWAYS_URL` pour les tests) les remplacent, et
   les arguments de la ligne de commande remplacent les variables.
@@ -129,7 +132,7 @@ python -m pytest -v -m "not slow"        # sans les tests de bout en bout
 
 | Workflow | Déclencheur | Jobs |
 |---|---|---|
-| [`dat535-dev.yml`](../.github/workflows/dat535-dev.yml) | push sur `dev`, pull request vers `dev` ou `main`, **chaque nuit** (02:17 UTC), manuel (case `explore` : exploration seule) | **tests** (runner GitHub) → **pipeline-dev** (runner de la VM, environnement `dev`, échantillon dans `~/opdi-data-dev`) |
+| [`dat535-dev.yml`](../.github/workflows/dat535-dev.yml) | push sur `dev`, pull request vers `dev` ou `main`, **chaque nuit** (02:17 UTC), manuel (case `explore` : exploration seule ; case `notebooks` : exécution des notebooks) | **tests** (runner GitHub) → **pipeline-dev** (runner de la VM, environnement `dev`, échantillon dans `~/opdi-data-dev`) |
 | [`dat535-prod.yml`](../.github/workflows/dat535-prod.yml) | push sur `main` (merge), **le 1er de chaque mois**, manuel | **tests** → **pipeline-prod** (runner de la VM, environnement `main` : **approbation manuelle**, périmètre complet dans `~/opdi-data`) |
 | [`labs.yml`](../.github/workflows/labs.yml) | manuel | pipelines des labs 2 et 3 |
 
