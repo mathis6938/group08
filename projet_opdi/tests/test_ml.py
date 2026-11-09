@@ -8,6 +8,7 @@ from pyspark.sql.types import DoubleType, StringType, StructField, StructType, T
 from opdi_pipeline import schemas
 from opdi_pipeline.config import MLSettings, Settings
 from opdi_pipeline.ml import (
+    smooth_day,
     build_airport_typology,
     build_arrival_ml_features,
     build_scenarios_table,
@@ -87,19 +88,22 @@ def test_gbt_and_baseline_evaluation(spark):
     # Scenarios schema check
     scenarios_df = build_scenarios_table(spark, model, test_prepped, DummyML())
     assert scenarios_df.count() > 0
+    assert scenarios_df.filter("predicted_total_min_before < 0 AND saving_min_per_day IS NULL").count() == 0
     assert schemas.compare(scenarios_df.schema, schemas.GOLD["ml_scenarios"]) == []
 
 
 def test_airport_typology_clustering(spark):
+    def day(apt, arrivals, add, level, holding, measured_share=0.8):
+        measured = int(arrivals * measured_share)
+        return Row(airport_icao=apt, arrivals=arrivals, arrivals_measured=measured, avg_additional_min=add,
+                   total_additional_min=add * measured, avg_level_minutes=level, pct_with_holding=holding)
+
     daily_rows = [
-        Row(airport_icao="LFPG", arrivals=300, avg_additional_min=8.5, avg_level_minutes=7.2, pct_with_holding=15.0),
-        Row(airport_icao="LFPG", arrivals=320, avg_additional_min=9.0, avg_level_minutes=7.5, pct_with_holding=18.0),
-        Row(airport_icao="LFBO", arrivals=120, avg_additional_min=2.1, avg_level_minutes=2.0, pct_with_holding=2.0),
-        Row(airport_icao="LFBO", arrivals=110, avg_additional_min=1.9, avg_level_minutes=1.8, pct_with_holding=1.5),
-        Row(airport_icao="ENZV", arrivals=40, avg_additional_min=0.8, avg_level_minutes=0.5, pct_with_holding=0.0),
-        Row(airport_icao="ENZV", arrivals=45, avg_additional_min=0.9, avg_level_minutes=0.6, pct_with_holding=0.0),
-        Row(airport_icao="EGLL", arrivals=400, avg_additional_min=12.0, avg_level_minutes=9.0, pct_with_holding=25.0),
-        Row(airport_icao="EGLL", arrivals=420, avg_additional_min=13.0, avg_level_minutes=9.5, pct_with_holding=28.0),
+        day("LFPG", 300, 8.5, 7.2, 15.0), day("LFPG", 320, 9.0, 7.5, 18.0),
+        day("LFBO", 120, 2.1, 2.0, 2.0), day("LFBO", 110, 1.9, 1.8, 1.5),
+        day("ENZV", 40, 0.8, 0.5, 0.0), day("ENZV", 45, 0.9, 0.6, 0.0),
+        day("EGLL", 400, 12.0, 9.0, 25.0), day("EGLL", 420, 13.0, 9.5, 28.0),
+        day("LTFM", 500, 1.0, 1.0, 1.0, measured_share=0.01),   # arrival time almost never measured: excluded
     ]
     daily_df = spark.createDataFrame(daily_rows)
     airports_dim = spark.createDataFrame([
@@ -114,8 +118,22 @@ def test_airport_typology_clustering(spark):
 
     typology_df, meta = build_airport_typology(spark, DummyML(), daily_df, airports_dim)
 
-    assert typology_df.count() == 4
+    assert typology_df.count() == 4                                   # LTFM excluded (coverage 1 %)
+    labels = {r["airport_icao"]: r["cluster_label"] for r in typology_df.collect()}
+    assert "fluid" not in labels["EGLL"] and "fluid" in labels["ENZV"]
     assert meta["k"] in (2, 3)
     assert meta["silhouette"] >= -1.0
     # Schema check against contract
     assert schemas.compare(typology_df.schema, schemas.GOLD["airport_typology"]) == []
+
+
+def test_demand_smoothing_moves_the_excess_to_the_nearest_hours():
+    demand = [0] * 24
+    demand[7], demand[8], demand[9] = 12, 10, 4
+    new, moves = smooth_day(demand, cap=10)
+    assert sum(new) == sum(demand)                          # no flight lost or created
+    assert max(new) == 10                                   # cap respected
+    assert new[7] == 10 and new[6] == 2                     # 8h is full: 7h -> 6h (the nearest hour with room)
+    assert moves == {(7, 6): 2}
+    full, moves = smooth_day([20] * 24, cap=10)             # no room anywhere: nobody moves
+    assert full == [20] * 24 and moves == {}

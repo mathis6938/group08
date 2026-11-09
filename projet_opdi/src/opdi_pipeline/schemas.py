@@ -115,6 +115,7 @@ GOLD = {
         "_ml_built_at_utc": "timestamp"},
     "ml_scenarios": {
         "airport_icao": "string", "scenario": "string", "demand_cap": "bigint",
+        "measured_flights": "bigint", "flights_moved_per_day": "double",
         "predicted_total_min_before": "double", "predicted_total_min_after": "double",
         "saving_min_per_day": "double", "_ml_built_at_utc": "timestamp"},
     "airport_typology": {

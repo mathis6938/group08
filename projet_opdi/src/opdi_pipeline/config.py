@@ -35,7 +35,7 @@ class ArrivalsSettings:
     max_transit_min: float = 120.0
     min_group_flights: int = 20
     ref_percentile: float = 0.20
-    fuel_kg_per_level_min: float = 25.0
+    fuel_kg_per_level_min: float = 12.7     # EUROCONTROL 2018 CDO study: 46 kg / 217 s of level flight
     co2_factor: float = 3.16
 
 
@@ -50,6 +50,7 @@ class MLSettings:
     max_iter: int = 20
     max_depth: int = 5
     demand_cap_pctl: float = 0.90
+    typology_min_coverage_pct: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -151,7 +152,7 @@ def load_settings(env="prod", **overrides):
         max_transit_min=float(arr_cfg.get("max_transit_min", 120.0)),
         min_group_flights=int(arr_cfg.get("min_group_flights", 20)),
         ref_percentile=float(arr_cfg.get("ref_percentile", 0.20)),
-        fuel_kg_per_level_min=float(arr_cfg.get("fuel_kg_per_level_min", 25.0)),
+        fuel_kg_per_level_min=float(arr_cfg.get("fuel_kg_per_level_min", 12.7)),
         co2_factor=float(arr_cfg.get("co2_factor", 3.16)),
     )
 
@@ -165,6 +166,7 @@ def load_settings(env="prod", **overrides):
         max_iter=int(ml_cfg.get("max_iter", 20)),
         max_depth=int(ml_cfg.get("max_depth", 5)),
         demand_cap_pctl=float(ml_cfg.get("demand_cap_pctl", 0.90)),
+        typology_min_coverage_pct=float(ml_cfg.get("typology_min_coverage_pct", 30.0)),
     )
 
     settings = Settings(

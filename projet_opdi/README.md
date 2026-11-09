@@ -161,9 +161,10 @@ Pour répondre à cette question sans biaiser les résultats avec des heures de 
 ### Indicateur A — Temps de transit additionnel en phase d'arrivée (type ASMA)
 - **Anneau d'entrée à 100 NM :** Le franchissement du rayon de 100 NM (185,2 km) autour de l'aérodrome de destination est calculé par **interpolation linéaire** entre le dernier jalon en croisière hors de l'anneau et le premier jalon détecté à l'intérieur.
 - **Temps de transit réel :** Durée écoulée entre l'entrée dans l'anneau de 100 NM et le franchissement du seuil de piste (`landing` ou `entry-runway` le plus proche).
-- **Temps de référence non contraint (*unimpeded reference time*) :** 20ème percentile des temps de transit observés en conditions fluides, calculé par classe de distance du vol, secteur cardinal d'entrée (N, NE, E, SE, S, SW, W, NW) et piste d'atterrissage.
+- **Temps de référence non contraint (*unimpeded reference time*) :** 20ème percentile des temps de transit observés en conditions fluides, calculé par catégorie d'appareil (`aircraft_class`), secteur cardinal d'entrée (N, NE, E, SE, S, SW, W, NW) et piste d'atterrissage, sur au moins 20 vols (sinon repli).
   - *Hiérarchie de repli automatique :* `(piste, classe, secteur)` $\to$ `(classe, secteur)` $\to$ aéroport global.
-- **Temps additionnel :** $\max(0, \text{temps réel} - \text{temps de référence})$.
+- **Temps additionnel :** temps réel − temps de référence (non tronqué : légèrement négatif pour les vols plus rapides que la référence). Même définition dans le Gold et dans la couche `ml`.
+- **Limite :** si presque tous les vols d'un groupe attendent, le 20e percentile inclut l'attente et ne la voit plus comme « additionnelle » (comme l'indicateur ASMA).
 
 ### Indicateur B — Efficacité verticale de descente (CDO) & Attentes
 - **Fenêtre de descente :** Délimitée à 200 NM de la destination à partir du début effectif de descente (première décroissance d'altitude sous l'altitude de croisière $\pm 300\text{ ft}$).
@@ -172,7 +173,7 @@ Pour répondre à cette question sans biaiser les résultats avec des heures de 
 - **Ventilation par bandes d'altitude :** Analyse des paliers selon 4 tranches critiques : `<FL70`, `FL70-100`, `FL100-200`, `>=FL200`.
 - **Détection des circuits d'attente (*holdings*) :** Identification géométrique des hippodromes sur critères stricts : durée cumulée $\ge 4\text{ min}$ et ratio $\frac{\text{distance parcourue}}{\text{déplacement direct}} \ge 1{,}5$.
 - **Modèle de carburant et émissions CO₂ :**
-  - Surconsommation en palier basse/moyenne altitude : évaluée à **$25\text{ kg}/\text{min}$**.
+  - **Hypothèse** de surconsommation : **12,7 kg de carburant par minute de palier**, déduite de l'étude EUROCONTROL de 2018 sur les descentes continues (trafic ECAC 2017) : 46 kg de carburant économisables par vol pour 217 s de palier en moyenne depuis le début de descente ([source](https://www.eurocontrol.int/concept/continuous-climb-and-descent-operations)). C'est un ordre de grandeur moyen, pas un calcul par type d'avion.
   - Facteur d'émission standardisé : **$3{,}16\text{ kg de CO}_2 / \text{kg de carburant}$**.
 
 ### Régularité temporelle & Heures incomplètes
@@ -182,18 +183,18 @@ Pour répondre à cette question sans biaiser les résultats avec des heures de 
 ### Modélisation Machine Learning, Scénarios & Typologie (Couche `ml`)
 - **Modèle explicatif `GBTRegressor` (temps additionnel) :**
   - Entraîné uniquement sur les arrivées mesurées (`is_transit_plausible`) lors des **heures complètes**.
-  - Variables explicatives : demande horaire locale (`arrivals`), demande de l'heure précédente (lagged), aéroport (`dest_icao`), heure (`arrival_hour`), jour de la semaine (`day_of_week`), secteur d'entrée (`entry_sector`), piste d'atterrissage (`arrival_runway`), classe d'appareil (`aircraft_class`), compagnie aérienne (`operator_icao` - top 30 sinon `OTHER`), nombre de paliers de descente (`level_off_count`).
-  - **Découpage temporel strict :** Entraînement sur tout le périmètre sauf les 14 derniers jours (3 derniers jours en dev), test sur les derniers jours (garantissant l'absence totale de fuite d'information).
-  - **Contrôle qualité bloquant pour publication :** Le modèle n'est publié que s'il bat la référence naïve (moyenne par aéroport et heure sur le jeu d'entraînement) en MAE.
+  - Variables explicatives : demande horaire locale (`arrivals`), demande de l'heure précédente (lagged), aéroport (`dest_icao`), heure (`arrival_hour`), jour de la semaine (`day_of_week`), secteur d'entrée (`entry_sector`), piste d'atterrissage (`arrival_runway`), classe d'appareil (`aircraft_class`), compagnie aérienne (`operator_icao` - top 30 sinon `OTHER`), **facteur de charge** (`load_factor` = demande de l'heure / 90e percentile de la demande horaire de l'aéroport, une échelle commune à tous les aéroports). Le nombre de paliers n'est **pas** une variable explicative : les paliers font partie du temps perdu que le modèle explique.
+  - **Découpage temporel strict :** Entraînement sur tout le périmètre sauf les 14 derniers jours (3 derniers jours en dev), test sur les derniers jours (pas de découpage aléatoire). Limite : les temps de référence du Gold sont calculés sur toute la période.
+  - **Contrôle qualité pour publication :** Le modèle n'est publié que s'il bat la référence naïve (moyenne par aéroport et heure sur le jeu d'entraînement) en MAE. Sinon les tables du modèle d'un run précédent sont supprimées du Gold et le résumé du run affiche un avertissement (non bloquant).
   - Sauvegarde du modèle : versionné par run dans `<data_root>/models/<run_id>/arrival_gbt`.
 - **Importance des variables (`gold/ml_feature_importance`) :** Poids relatif de chaque variable calculé à partir de `featureImportances` et classé par rang décroissant.
 - **Scénarios de régulation de flux (`gold/ml_scenarios`) :**
-  - Simulation d'un plafonnement de la demande horaire au 90ème percentile sur les aéroports focus, avec redistribution sur les heures creuses adjacentes.
+  - Simulation, sur la période de test, d'un plafonnement de la demande horaire au 90ème percentile de l'aéroport : les vols en excès sont reportés sur les heures les plus proches qui ont de la place, le même jour (aucun vol supprimé) ; chaque vol reçoit la nouvelle demande de son heure et le modèle prédit le temps additionnel avant / après. C'est une simulation sur un modèle d'association, pas une prédiction causale.
   - Estimation des minutes totales gagnées par jour (`saving_min_per_day`).
 - **Typologie des aéroports (`gold/airport_typology`) :**
-  - Profilage multidimensionnel par aéroport (trafic journalier, temps additionnel moyen et p90, minutes de palier, % d'attentes, variabilité temporelle).
+  - Profilage par aéroport (trafic journalier, temps additionnel moyen et p90, minutes de palier, % d'attentes, variabilité), moyennes pondérées par les vols ; seuls les aéroports représentatifs sont classés (au moins `min_arrivals` arrivées mesurées et au moins 30 % des arrivées mesurées).
   - Normalisation `StandardScaler` et clustering non supervisé `KMeans` avec sélection optimale du nombre de clusters $k$ par score silhouette (`ClusteringEvaluator`).
-  - Attribution de libellés sémantiques aux profils d'exploitation (*« Congested Hub with Regular Holdings »*, *« High-Density Continuous Flow »*, *« Fluid Regional Airport »*...).
+  - Libellés déduits des centres des groupes, comparés aux quartiles des aéroports classés (taille : *Large / Medium / Small airports* ; traits : *high additional time*, *frequent holdings*, *stepped descents* ou *fluid arrivals*).
 
 ### Mise en œuvre et performance
 - `arrivals.py` lit les tables Silver **déjà écrites** (et `bronze/measurements`), jamais les DataFrames paresseux du

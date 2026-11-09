@@ -120,6 +120,12 @@ def test_silver_finds_the_planted_defects(pipeline_run, spark):
     assert arr.filter("holding_count > 0").count() == exp["holdings"]
     # Check that entry sector is assigned (due north in synthetic data)
     assert arr.filter("entry_sector = 'N'").count() == exp["measured_arrivals"]
+    # Known arrival transit times. Ring entry (185.2 km) interpolated between the cruise event at 240 km (landing - 38
+    # min) and the top of descent at 150 km (landing - 25 min, or - 31 min with the 6-min holding pattern); landing =
+    # runway entry at landing - 0.5 min:  38 - 0.6088 * 13 - 0.5 = 29.58 min  /  38 - 0.6088 * 7 - 0.5 = 33.24 min
+    transit = {r["flight_id"]: r["transit_min"] for r in arr.filter("flight_id <= 300").collect()}
+    assert all(t == pytest.approx(33.24, abs=0.05) for f, t in transit.items() if f % 3 == 0)
+    assert all(t == pytest.approx(29.58, abs=0.05) for f, t in transit.items() if f % 3 != 0)
 
     lev = read(spark, data_root / "silver" / "descent_level_offs")
     assert lev.count() == exp["fused_level_offs"]
@@ -157,6 +163,15 @@ def test_gold_figures(pipeline_run, spark):
     arr_ref = read(spark, data_root / "gold" / "arrival_reference")
     assert arr_ref.count() > 0
     assert arr_ref.filter("ref_transit_min <= 0").count() == 0
+    # 20th percentile of the transit times of each group. In the synthetic routes, every flight to ENGM holds (its
+    # flight ids are all multiples of 3): its reference is the holding time itself, so a percentile reference cannot
+    # see a delay that every flight suffers (a limit of the method, as in the ASMA indicator). Elsewhere 2/3 of the
+    # flights do not hold: reference = unimpeded 29.58 min, so a holding flight has 33.24 - 29.58 = 3.66 min of
+    # additional time and the others 0.
+    refs = {(r["airport_icao"], r["fallback_level"]): r["ref_transit_min"] for r in arr_ref.collect()}
+    assert all(v == pytest.approx(33.24 if apt == "ENGM" else 29.58, abs=0.05) for (apt, _), v in refs.items()), refs
+    hourly = read(spark, data_root / "gold" / "airport_arrival_hourly").filter("arrivals_measured > 0")
+    assert hourly.filter("avg_additional_min < -0.05 OR avg_additional_min > 3.71").count() == 0
 
     hotspots = read(spark, data_root / "gold" / "holding_hotspots")
     assert hotspots.count() > 0
@@ -169,7 +184,12 @@ def test_gold_figures(pipeline_run, spark):
 
     # Check ML layer report and published tables
     ml_rep = report(data_root, RUN_ID, "ml")
-    assert ml_rep["status"] in ("PASSED", "SKIPPED")
+    assert ml_rep["status"] in ("PASSED", "FAILED", "SKIPPED")
+    assert (data_root / "gold" / "airport_typology").exists()                 # descriptive: always written
+    if ml_rep["status"] == "FAILED":         # model worse than the naive baseline: nothing of the model published
+        # (on the synthetic data the extra time only depends on the planted holdings, which no feature describes)
+        assert not (data_root / "gold" / "ml_feature_importance").exists()
+        assert not (data_root / "gold" / "ml_scenarios").exists()
     if ml_rep["status"] == "PASSED":
         assert (data_root / "gold" / "ml_feature_importance").exists()
         assert (data_root / "gold" / "ml_scenarios").exists()
@@ -183,6 +203,8 @@ def test_published_tables_match_their_schema_contract(pipeline_run, spark):
     data_root, _, _, _ = pipeline_run
     for layer, contracts in [("silver", schemas.SILVER), ("gold", schemas.GOLD)]:
         for table, contract in contracts.items():
+            if table in ("ml_feature_importance", "ml_scenarios") and not (data_root / layer / table).exists():
+                continue                                    # model not published by this run (see test_gold_figures)
             assert schemas.compare(read(spark, data_root / layer / table).schema, contract) == [], (layer, table)
     gold = json.loads((data_root / "reports" / RUN_ID / "gold.json").read_text())
     assert all(v for k, v in gold["checks"].items() if "schema" in k)
