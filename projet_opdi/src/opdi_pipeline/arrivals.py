@@ -11,12 +11,13 @@ Writes:
 """
 import math
 
+from pyspark import StorageLevel
 from pyspark.sql import Window
 from pyspark.sql.functions import (
     abs as spark_abs,
-    asin, atan2, avg, broadcast, coalesce, col,
-    cos, current_timestamp, degrees, desc, first, hour,
-    lag, last, lead, lit, lower, max as spark_max, min as spark_min,
+    asin, atan2, broadcast, coalesce, col,
+    cos, current_timestamp, degrees, desc, hour,
+    lag, lead, lit, max as spark_max, min as spark_min, struct,
     percentile_approx, radians, regexp_replace, row_number, sin, sqrt,
     sum as spark_sum, to_date, to_timestamp, trim, unix_timestamp, upper, when,
 )
@@ -124,11 +125,22 @@ def spark_entry_sector(bearing_col):
 
 
 # --------------------------------------------------------------------------------- Pipeline logic
-def compute_arrivals(spark, settings, silver_flights, silver_events, silver_airports, bronze_measurements):
-    """Build silver/arrivals and silver/descent_level_offs DataFrames."""
+def compute_level_offs(spark, settings, silver_flights, silver_events, silver_airports, bronze_measurements):
+    """First half of the arrival study: the fused descent level-offs, and the per-flight parts of silver/arrivals.
+
+    The inputs must be the *written* Silver tables (and Bronze measurements), never the lazy DataFrames of the Silver
+    run: with lazy inputs Spark recomputes the whole Silver chain (Bronze read, standardisation, deduplication of
+    ~86 M events) for each action, which exhausted the driver memory in prod (run prod-5, GC overhead limit).
+
+    Returns (level_offs, parts): the level-offs DataFrame (to be written first) and the DataFrames that
+    assemble_arrivals needs. parts["cached"] lists the persisted DataFrames to release once both tables are written.
+    """
     cfg = settings.arrivals
     ring_radius_km = cfg.ring_radius_nm * 1.852
     descent_radius_km = cfg.descent_radius_nm * 1.852
+    # The ring transition needs the event *before* the 100 NM ring: keep the events up to 3 x 100 NM (and at least
+    # the 200 NM descent window). Everything farther is cruise, useless for both indicators.
+    candidate_radius_km = max(3.0 * ring_radius_km, descent_radius_km)
 
     # 1. Target flights: destination known with coordinates
     airports_dim = silver_airports.select(
@@ -148,8 +160,11 @@ def compute_arrivals(spark, settings, silver_flights, silver_events, silver_airp
     )
 
     # 2. Attach destination position to events of destination flights
+    # Only the columns used below are read (Parquet column pruning: the `info` map is not read for all events), and
+    # only the events near the destination are kept. The result is reused by several steps: persisted on disk.
     events_with_dest = (
         silver_events
+        .select("event_id", "flight_id", "event_type", "event_timestamp_utc", "latitude", "longitude", "altitude_ft")
         .filter(col("latitude").between(-90, 90) & col("longitude").between(-180, 180))
         .join(
             dest_flights.select("flight_id", "dest_icao", "dest_lat", "dest_lon", "dest_elevation_ft", "last_seen_utc"),
@@ -157,15 +172,23 @@ def compute_arrivals(spark, settings, silver_flights, silver_events, silver_airp
             "inner",
         )
         .withColumn("dist_km", spark_haversine_km(col("latitude"), col("longitude"), col("dest_lat"), col("dest_lon")))
+        .filter(col("dist_km") <= candidate_radius_km)
+        .persist(StorageLevel.DISK_ONLY)
     )
 
     # 3. Indicator A: Landing detection (first entry-runway at destination <= elevation + 1500 ft)
     # Filter runway events at destination within ring radius
+    # Separate scan of the runway events only (~2 % of the events): the only place where the `info` map is read.
     runway_events = (
-        events_with_dest
+        silver_events
+        .filter(col("event_type") == "entry-runway")
+        .select("event_id", "flight_id", "event_timestamp_utc", "latitude", "longitude", "altitude_ft",
+                col("info").getItem("osm_airport").alias("osm_airport"),
+                col("info").getItem("osm_ref").alias("osm_ref"))
+        .join(dest_flights.select("flight_id", "dest_icao", "dest_lat", "dest_lon", "dest_elevation_ft"), "flight_id")
+        .withColumn("dist_km", spark_haversine_km(col("latitude"), col("longitude"), col("dest_lat"), col("dest_lon")))
         .filter(
-            (col("event_type") == "entry-runway")
-            & (col("info").getItem("osm_airport") == col("dest_icao"))
+            (col("osm_airport") == col("dest_icao"))
             & (col("dist_km") <= ring_radius_km)
             & (col("altitude_ft") <= col("dest_elevation_ft") + 1500.0)
         )
@@ -178,7 +201,7 @@ def compute_arrivals(spark, settings, silver_flights, silver_events, silver_airp
         .select(
             "flight_id",
             col("event_timestamp_utc").alias("landing_utc"),
-            regexp_replace(upper(trim(col("info").getItem("osm_ref"))), r"\s*[/;]\s*|\s+", "-").alias("arrival_runway"),
+            regexp_replace(upper(trim(col("osm_ref"))), r"\s*[/;]\s*|\s+", "-").alias("arrival_runway"),
         )
     )
 
@@ -248,15 +271,13 @@ def compute_arrivals(spark, settings, silver_flights, silver_events, silver_airp
     )
 
     # 6. Indicator B: Level-off segments in descent window
-    # Filter bronze measurements for distance flown and time passed
+    # Only the cumulative distance flown is used (holding detection): one measurement type, one row per event, so a
+    # plain join on event_id (no aggregation of the ~119 M Bronze measurement rows).
     meas = (
         bronze_measurements
-        .filter(col("type").isin("Distance flown (NM)", "Time Passed (s)", "Time passed (s)"))
-        .groupBy("event_id")
-        .agg(
-            first(when(col("type") == "Distance flown (NM)", col("value"))).alias("distance_flown_nm"),
-            first(when(lower(col("type")).startswith("time pass"), col("value"))).alias("time_passed_s"),
-        )
+        .filter(col("type") == "Distance flown (NM)")
+        .select(col("event_id").cast(LongType()).alias("event_id"),
+                col("value").cast(DoubleType()).alias("distance_flown_nm"))
     )
 
     level_events = (
@@ -329,14 +350,18 @@ def compute_arrivals(spark, settings, silver_flights, silver_events, silver_airp
             spark_min("seg_start_utc").alias("start_utc"),
             spark_max("seg_end_utc").alias("end_utc"),
             spark_round(percentile_approx("seg_alt_ft", 0.5), 1).alias("altitude_ft"),
-            first("seg_start_lat").alias("start_lat"),
-            first("seg_start_lon").alias("start_lon"),
-            last("seg_end_lat").alias("end_lat"),
-            last("seg_end_lon").alias("end_lon"),
-            first("seg_start_flown_nm").alias("flown_start_nm"),
-            last("seg_end_flown_nm").alias("flown_end_nm"),
+            # first chunk / last chunk of the level-off: min / max of a struct ordered by time (deterministic,
+            # unlike first() / last(), whose result depends on the row order after a shuffle)
+            spark_min(struct("seg_start_utc", "seg_start_lat", "seg_start_lon", "seg_start_flown_nm")).alias("_first"),
+            spark_max(struct("seg_end_utc", "seg_end_lat", "seg_end_lon", "seg_end_flown_nm")).alias("_last"),
             spark_sum(lit(1)).alias("segments_merged"),
         )
+        .withColumn("start_lat", col("_first.seg_start_lat"))
+        .withColumn("start_lon", col("_first.seg_start_lon"))
+        .withColumn("end_lat", col("_last.seg_end_lat"))
+        .withColumn("end_lon", col("_last.seg_end_lon"))
+        .withColumn("flown_start_nm", col("_first.seg_start_flown_nm"))
+        .withColumn("flown_end_nm", col("_last.seg_end_flown_nm"))
         .withColumn(
             "duration_min",
             spark_round((unix_timestamp("end_utc") - unix_timestamp("start_utc")) / 60.0, 2),
@@ -385,9 +410,20 @@ def compute_arrivals(spark, settings, silver_flights, silver_events, silver_airp
         )
     )
 
+    parts = dict(dest_flights=dest_flights, flight_ring_entries=flight_ring_entries, flight_landings=flight_landings,
+                 descent_bounds=descent_bounds, cached=[events_with_dest])
+    return merged_levels, parts
+
+
+def assemble_arrivals(settings, parts, level_offs):
+    """Second half: silver/arrivals, one row per arrival, from the parts and the *written* level-offs table."""
+    cfg = settings.arrivals
+    dest_flights, flight_ring_entries = parts["dest_flights"], parts["flight_ring_entries"]
+    flight_landings, descent_bounds = parts["flight_landings"], parts["descent_bounds"]
+
     # 7. Aggregate level-off metrics per flight for silver/arrivals
     flight_level_metrics = (
-        merged_levels
+        level_offs
         .groupBy("flight_id")
         .agg(
             spark_sum(lit(1)).cast(LongType()).alias("level_off_count"),
@@ -448,32 +484,40 @@ def compute_arrivals(spark, settings, silver_flights, silver_events, silver_airp
         )
     )
 
-    return arrivals, merged_levels
+    return arrivals
 
 
-def run(spark, settings, silver_flights=None, silver_events=None, silver_airports=None):
-    """Run arrivals module, write silver/arrivals and silver/descent_level_offs, return summary stats."""
+def run(spark, settings):
+    """Run arrivals module, write silver/descent_level_offs then silver/arrivals, return summary stats.
+
+    Always reads the Silver tables written by the Silver layer (see compute_level_offs).
+    """
     steps = Steps()
     s = settings.silver_dir
-    if silver_flights is None:
-        silver_flights = spark.read.parquet(str(s / "flights"))
-    if silver_events is None:
-        silver_events = spark.read.parquet(str(s / "flight_events"))
-    if silver_airports is None:
-        silver_airports = spark.read.parquet(str(s / "airports"))
-
+    silver_flights = spark.read.parquet(str(s / "flights"))
+    silver_events = spark.read.parquet(str(s / "flight_events"))
+    silver_airports = spark.read.parquet(str(s / "airports"))
     bronze_measurements = spark.read.parquet(str(settings.bronze_dir / "measurements"))
 
-    with steps.step("compute arrivals & descent level-offs"):
-        arrivals_df, level_offs_df = compute_arrivals(
-            spark, settings, silver_flights, silver_events, silver_airports, bronze_measurements
-        )
+    # Windows over tens of millions of events: more, smaller shuffle partitions keep the memory of each task low
+    # (AQE merges the small ones afterwards). Restored at the end.
+    previous_partitions = spark.conf.get("spark.sql.shuffle.partitions")
+    spark.conf.set("spark.sql.shuffle.partitions", str(max(int(previous_partitions), 64)))
+    try:
+        with steps.step("compute arrivals & descent level-offs"):
+            level_offs_df, parts = compute_level_offs(
+                spark, settings, silver_flights, silver_events, silver_airports, bronze_measurements)
 
-    with steps.step("write silver/arrivals"):
-        write_table(arrivals_df, s / "arrivals", ["_source_period"])
+        with steps.step("write silver/descent_level_offs"):
+            write_table(level_offs_df, s / "descent_level_offs")
 
-    with steps.step("write silver/descent_level_offs"):
-        write_table(level_offs_df, s / "descent_level_offs")
+        with steps.step("write silver/arrivals"):
+            level_offs_written = spark.read.parquet(str(s / "descent_level_offs"))
+            write_table(assemble_arrivals(settings, parts, level_offs_written), s / "arrivals", ["_source_period"])
+    finally:
+        for df in parts.get("cached", []) if "parts" in locals() else []:
+            df.unpersist()
+        spark.conf.set("spark.sql.shuffle.partitions", previous_partitions)
 
     # Read back to compute report metrics
     arr = spark.read.parquet(str(s / "arrivals"))

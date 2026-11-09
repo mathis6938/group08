@@ -82,6 +82,8 @@ jobs:
           echo "DATA=$HOME/opdi-data" >> "$GITHUB_ENV"
           echo "LOGS=$HOME/opdi-data/logs/$OPDI_RUN_ID" >> "$GITHUB_ENV"
           mkdir -p "$HOME/opdi-data/logs/$OPDI_RUN_ID"
+          # resources of the VM at the start of the run (memory / CPU / disk), kept in the log of the run
+          { date -u; free -h; nproc; df -h "$HOME"; } | tee "$HOME/opdi-data/logs/$OPDI_RUN_ID/0_resources.log"
 
       - name: "1/6 Ingest: download the OPDI and OurAirports files (raw/, manifest)"
         run: |
