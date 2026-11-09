@@ -55,7 +55,7 @@ def pipeline_run(tmp_path_factory, site):
            "OPDI_RUNWAYS_URL": f"{url}/ourairports/runways.csv",
            "PYSPARK_PYTHON": sys.executable}
     logs = {}
-    for layer in ("ingest", "bronze", "silver", "gold", "summary"):     # one process per layer, as in the CI
+    for layer in ("ingest", "bronze", "silver", "gold", "ml", "summary"):     # one process per layer, as in the CI
         code, logs[layer] = run_cli(layer, env)
         assert code == 0, f"layer {layer} failed:\n{logs[layer][-4000:]}"
     yield data_root, env, expected, logs
@@ -69,7 +69,7 @@ def read(spark, path):
 @pytest.mark.slow
 def test_pipeline_runs_and_publishes(pipeline_run):
     data_root, _, _, logs = pipeline_run
-    for layer in ("ingest", "bronze", "silver", "gold", "summary"):
+    for layer in ("ingest", "bronze", "silver", "gold", "ml", "summary"):
         assert (data_root / "reports" / RUN_ID / f"{layer}.json").exists()
     assert "END-TO-END PIPELINE: PASSED" in logs["summary"]
     summary = json.loads((data_root / "pipeline_summary.json").read_text())
@@ -166,6 +166,15 @@ def test_gold_figures(pipeline_run, spark):
     gold_rep = report(data_root, RUN_ID, "gold")
     assert any(h["movement_hour"] == 14 and "2026-06-09" in str(h["movement_date"])
                for h in gold_rep.get("incomplete_hours", []))
+
+    # Check ML layer report and published tables
+    ml_rep = report(data_root, RUN_ID, "ml")
+    assert ml_rep["status"] in ("PASSED", "SKIPPED")
+    if ml_rep["status"] == "PASSED":
+        assert (data_root / "gold" / "ml_feature_importance").exists()
+        assert (data_root / "gold" / "ml_scenarios").exists()
+        assert (data_root / "gold" / "airport_typology").exists()
+        assert read(spark, data_root / "gold" / "airport_typology").count() > 0
 
 
 @pytest.mark.slow

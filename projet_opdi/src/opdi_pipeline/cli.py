@@ -28,10 +28,10 @@ def parse_layers(value):
 
 
 def run_layer(layer, spark, settings):
-    from . import bronze, explore, gold, ingestion, quality, silver
+    from . import bronze, explore, gold, ingestion, ml, quality, silver
     if layer == "ingest":
         return ingestion.run(settings)
-    modules = {"bronze": bronze, "silver": silver, "gold": gold, "summary": quality, "explore": explore}
+    modules = {"bronze": bronze, "silver": silver, "gold": gold, "ml": ml, "summary": quality, "explore": explore}
     return modules[layer].run(spark, settings)
 
 

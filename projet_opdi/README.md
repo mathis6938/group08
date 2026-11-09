@@ -26,6 +26,7 @@ projet_opdi/
 │   │                            #   (API DataFrame)
 │   ├── arrivals.py              #   efficacité arrivées (anneau 100 NM, profils de descente, attentes)
 │   ├── gold.py + sql/*.sql      #   activité des aéroports en Spark SQL, validation, publication -> gold/
+│   ├── ml.py                    #   modèle GBT temps additionnel, scénarios, typologie KMeans -> gold/, models/
 │   ├── schemas.py               #   contrats de schéma : sources (raw), tables Silver et Gold publiées
 │   ├── quality.py               #   synthèse du run : contrôles qualité, volumes, durées
 │   ├── performance.py           #   mesures de performance (notebook 03)
@@ -34,7 +35,8 @@ projet_opdi/
 │   ├── 01_data_understanding.ipynb   # profilage des tables Bronze
 │   ├── 02_pipeline_walkthrough.ipynb # le pipeline couche par couche, avec les preuves de chaque couche
 │   ├── 03_performance.ipynb          # goulots d'étranglement et optimisations mesurées
-│   └── 04_gold_dashboard.ipynb       # tableau de bord : le consommateur du Gold (graphiques LFBO, ENZV...)
+│   ├── 04_gold_dashboard.ipynb       # tableau de bord : le consommateur du Gold (graphiques LFBO, ENZV...)
+│   └── 05_arrival_efficiency.ipynb   # étude de l'efficacité des arrivées et machine learning (8 visualisations)
 ├── tests/                       # pytest (voir « Tests »)
 ├── requirements-test.txt, pytest.ini
 └── scripts/                     # scripts d'exploration du début du projet
@@ -51,8 +53,10 @@ projet_opdi/
 ├── quarantine/              # lignes rejetées, avec leur motif (_quarantine_reason)
 ├── gold/                    # airport_daily_ops, airport_hourly_ops, runway_usage, airport_ground_times,
 │                            # arrival_reference, airport_arrival_daily, airport_arrival_hourly, holding_hotspots,
+│                            # ml_feature_importance, ml_scenarios, airport_typology,
 │                            # run_status (historique des publications), _SUCCESS (Gold prêt)
-├── reports/<run id>/        # rapport JSON de chaque couche d'un run (ingest, bronze, silver, gold, summary)
+├── models/<run id>/         # modèle prédictif Spark MLlib entraîné (arrival_gbt)
+├── reports/<run id>/        # rapport JSON de chaque couche d'un run (ingest, bronze, silver, gold, ml, summary)
 ├── logs/<run id>/           # logs de chaque couche (runs GitHub Actions)
 └── pipeline_summary.json    # synthèse du dernier run (contrôles qualité, volumes, quarantaine, durées)
 ```
@@ -72,7 +76,7 @@ python projet_opdi/run_pipeline.py --env dev --layer explore     # à la demande
 python projet_opdi/run_pipeline.py --help
 ```
 
-- Couches : `ingest`, `bronze`, `silver`, `gold`, `summary` (ou `all`, la valeur par défaut). Elles communiquent
+- Couches : `ingest`, `bronze`, `silver`, `gold`, `ml`, `summary` (ou `all`, la valeur par défaut). Elles communiquent
   uniquement par les tables écrites sur disque : chacune peut être relancée seule.
 - Le run s'arrête avec le code 1 si un contrôle qualité échoue. Les couches suivantes ne tournent pas, et le Gold
   n'est pas publié. Les contrôles :
@@ -117,7 +121,8 @@ python -m pytest -v -m "not slow"        # sans les tests de bout en bout
 | `test_schemas.py` | contrats de schéma ; un fichier source au schéma de 2025 (ids `decimal`, colonne en plus) est détecté |
 | `test_silver_rules.py` | nettoyage (valeurs manquantes, codes OACI, périmètre) et chaque règle de quarantaine |
 | `test_arrival_rules.py` | géométrie d'arrivée (gisement, 8 secteurs, haversine, interpolation d'entrée 100 NM, détection d'attentes) |
-| `test_notebooks.py` | le code des notebooks vitrine reste valide |
+| `test_ml.py` | découpage temporel sans fuite, entraînement GBTRegressor, baseline naïve, clustering KMeans et contrats de schéma ML |
+| `test_notebooks.py` | le code des 5 notebooks vitrine reste valide |
 | `test_pipeline_smoke.py` | **tout le pipeline, couche par couche via la ligne de commande**, sur des données synthétiques servies par un faux serveur EUROCONTROL. On y a placé des défauts connus : doublons, dates illisibles, chronologie inversée, aéroports vides ou `"nan"`, événements orphelins, pistes traversées. Le test vérifie les chiffres exacts de chaque couche, les contrats de schéma des tables publiées, qu'un second run donne les mêmes tables sans rien reconstruire, qu'un fichier republié ne reconstruit que sa période, et qu'un contrôle qualité en échec arrête le run |
 
 ## CI/CD (GitHub Actions)
@@ -173,6 +178,22 @@ Pour répondre à cette question sans biaiser les résultats avec des heures de 
 ### Régularité temporelle & Heures incomplètes
 - Détection systématique des heures dont le trafic européen total est strictement inférieur à 50% de la médiane européenne pour l'heure correspondante (coupures d'ingestion ou pannes de capteurs).
 - Ces heures sont signalées (`is_complete_hour = false`), exclues des agrégations journalières et proscrites pour l'entraînement des modèles prédictifs.
+
+### Modélisation Machine Learning, Scénarios & Typologie (Couche `ml`)
+- **Modèle explicatif `GBTRegressor` (temps additionnel) :**
+  - Entraîné uniquement sur les arrivées mesurées (`is_transit_plausible`) lors des **heures complètes**.
+  - Variables explicatives : demande horaire locale (`arrivals`), demande de l'heure précédente (lagged), aéroport (`dest_icao`), heure (`arrival_hour`), jour de la semaine (`day_of_week`), secteur d'entrée (`entry_sector`), piste d'atterrissage (`arrival_runway`), classe d'appareil (`aircraft_class`), compagnie aérienne (`operator_icao` - top 30 sinon `OTHER`), nombre de paliers de descente (`level_off_count`).
+  - **Découpage temporel strict :** Entraînement sur tout le périmètre sauf les 14 derniers jours (3 derniers jours en dev), test sur les derniers jours (garantissant l'absence totale de fuite d'information).
+  - **Contrôle qualité bloquant pour publication :** Le modèle n'est publié que s'il bat la référence naïve (moyenne par aéroport et heure sur le jeu d'entraînement) en MAE.
+  - Sauvegarde du modèle : versionné par run dans `<data_root>/models/<run_id>/arrival_gbt`.
+- **Importance des variables (`gold/ml_feature_importance`) :** Poids relatif de chaque variable calculé à partir de `featureImportances` et classé par rang décroissant.
+- **Scénarios de régulation de flux (`gold/ml_scenarios`) :**
+  - Simulation d'un plafonnement de la demande horaire au 90ème percentile sur les aéroports focus, avec redistribution sur les heures creuses adjacentes.
+  - Estimation des minutes totales gagnées par jour (`saving_min_per_day`).
+- **Typologie des aéroports (`gold/airport_typology`) :**
+  - Profilage multidimensionnel par aéroport (trafic journalier, temps additionnel moyen et p90, minutes de palier, % d'attentes, variabilité temporelle).
+  - Normalisation `StandardScaler` et clustering non supervisé `KMeans` avec sélection optimale du nombre de clusters $k$ par score silhouette (`ClusteringEvaluator`).
+  - Attribution de libellés sémantiques aux profils d'exploitation (*« Congested Hub with Regular Holdings »*, *« High-Density Continuous Flow »*, *« Fluid Regional Airport »*...).
 
 ### Limites méthodologiques
 1. **Couverture des pistes :** L'assignation des pistes d'atterrissage dans les données ouvertes dépend des géométries OpenStreetMap et des événements au sol disponibles. La hiérarchie de repli garantit qu'aucun vol n'est privé de référence même si la piste est manquante.

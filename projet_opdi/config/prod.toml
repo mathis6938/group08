@@ -42,3 +42,14 @@ ref_percentile                   = 0.20    # 20th percentile for unconstrained r
 fuel_kg_per_level_min            = 25.0    # EUROCONTROL CDO benchmark: ~25 kg fuel / min level vs continuous descent
 co2_factor                       = 3.16    # ICAO standard conversion factor (kg CO2 / kg jet fuel)
 
+[ml]
+test_days        = 14      # test split: last 14 days of the period
+min_arrivals     = 100     # minimum measured arrivals for airport typology
+k_min            = 3       # minimum clusters for KMeans
+k_max            = 6       # maximum clusters for KMeans
+seed             = 42      # random seed for ML algorithms
+max_iter         = 20      # GBTRegressor iterations
+max_depth        = 5       # GBTRegressor tree depth
+demand_cap_pctl  = 0.90    # percentile threshold for demand capping scenario
+
+
