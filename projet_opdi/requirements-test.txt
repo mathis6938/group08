@@ -3,3 +3,4 @@ pyspark==3.5.0
 pyarrow
 pytest
 numpy
+pandas           # ml.build_scenarios_table (toPandas / createDataFrame); installed on the VM since lab 1
