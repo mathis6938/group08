@@ -181,11 +181,16 @@ def train_and_evaluate_gbt(train_df, test_df, settings):
         outputCol="features",
         handleInvalid="keep",
     )
+    # Ensure maxBins is at least as large as the number of categorical categories
+    n_dest = train_prepped.select("dest_icao").distinct().count()
+    max_bins = max(64, n_dest + 32, 512)
+
     gbt = GBTRegressor(
         featuresCol="features",
         labelCol="additional_min",
         maxIter=settings.ml.max_iter,
         maxDepth=settings.ml.max_depth,
+        maxBins=max_bins,
         seed=settings.ml.seed,
     )
 
