@@ -347,7 +347,7 @@ def run(spark, settings):
 
     with steps.step("arrivals"):
         from . import arrivals
-        arr_stats = arrivals.run(spark, settings, silver_flights, silver_events, airports)
+        arr_stats = arrivals.run(spark, settings)            # reads the Silver tables written above
         steps.durations.update({f"arrivals: {k}": v for k, v in arr_stats.pop("durations_s", {}).items()})
 
     log.info("Silver: %.2f GB | quarantine: %.3f GB | free space left: %.1f GB",

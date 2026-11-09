@@ -195,6 +195,16 @@ Pour répondre à cette question sans biaiser les résultats avec des heures de 
   - Normalisation `StandardScaler` et clustering non supervisé `KMeans` avec sélection optimale du nombre de clusters $k$ par score silhouette (`ClusteringEvaluator`).
   - Attribution de libellés sémantiques aux profils d'exploitation (*« Congested Hub with Regular Holdings »*, *« High-Density Continuous Flow »*, *« Fluid Regional Airport »*...).
 
+### Mise en œuvre et performance
+- `arrivals.py` lit les tables Silver **déjà écrites** (et `bronze/measurements`), jamais les DataFrames paresseux du
+  run Silver : sinon Spark recalcule toute la chaîne Silver (lecture du Bronze, standardisation, déduplication de
+  ~86 M d'événements) pour chaque écriture, ce qui a saturé la mémoire du driver au run prod-5
+  (`GC overhead limit exceeded`).
+- Seules les colonnes utiles sont lues, la carte `info` uniquement pour les événements de piste, et seuls les
+  événements à moins de 300 NM de la destination sont gardés ; ce sous-ensemble, réutilisé par plusieurs étapes, est
+  mis en cache sur disque. Des mesures, seule la distance parcourue est jointe (pas d'agrégation des 119 M lignes).
+- `silver/descent_level_offs` est écrite d'abord, puis relue pour construire `silver/arrivals`.
+
 ### Limites méthodologiques
 1. **Couverture des pistes :** L'assignation des pistes d'atterrissage dans les données ouvertes dépend des géométries OpenStreetMap et des événements au sol disponibles. La hiérarchie de repli garantit qu'aucun vol n'est privé de référence même si la piste est manquante.
 2. **Absence d'horaires programmés :** OPDI ne fournissant pas les horaires prévus de grille (créneaux IATA / OAG), le temps de transit réel et la référence unimpeded au 20ème percentile constituent la référence relative objective.
