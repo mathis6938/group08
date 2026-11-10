@@ -30,6 +30,10 @@ on:
         description: "Only run the exploration of the arrival phase on the published dev tables (no pipeline run)"
         type: boolean
         default: false
+      notebooks:
+        description: "Only execute the showcase notebooks 02, 04, 05 on the published PROD tables (read-only) and upload them"
+        type: boolean
+        default: false
 
 concurrency:                       # a new push cancels the dev run still in progress for the same branch
   group: dat535-dev-${{ github.ref }}
@@ -38,7 +42,7 @@ concurrency:                       # a new push cancels the dev run still in pro
 jobs:
   tests:
     name: Unit and end-to-end tests
-    if: ${{ !inputs.explore }}
+    if: ${{ !inputs.explore && !inputs.notebooks }}
     runs-on: ubuntu-latest         # GitHub-hosted: does not use the VM, works even when it is busy
     timeout-minutes: 30
     defaults:
@@ -69,7 +73,7 @@ jobs:
 
   pipeline-dev:
     name: Run pipeline on the dev sample
-    if: ${{ !inputs.explore }}
+    if: ${{ !inputs.explore && !inputs.notebooks }}
     needs: tests
     runs-on: self-hosted
     environment: dev
@@ -181,5 +185,50 @@ jobs:
           path: |
             ${{ env.LOGS }}/
             ${{ env.DATA }}/reports/${{ env.OPDI_RUN_ID }}/
+          retention-days: 7
+          if-no-files-found: warn
+
+  notebooks:
+    name: Execute the showcase notebooks (on demand)
+    if: ${{ inputs.notebooks }}    # Run workflow -> tick "notebooks": the VM's Jupyter is only reachable on campus
+    runs-on: self-hosted
+    environment: dev
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      SPARK_HOME: /opt/spark
+      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Execute notebooks 02, 04 and 05 (they only read ~/opdi-data; figures go to projet_opdi/docs/figures)
+        run: |
+          source ~/spark-env/bin/activate
+          OUT="$RUNNER_TEMP/notebooks"
+          mkdir -p "$OUT"
+          cd projet_opdi/notebooks
+          status=0
+          for nb in 02_pipeline_walkthrough 04_gold_dashboard 05_arrival_efficiency; do
+            echo "::group::$nb"
+            if ! jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=1800 \
+                   --output-dir "$OUT" "$nb.ipynb" > "$OUT/$nb.log" 2>&1; then
+              echo "::error::$nb failed (see $nb.log in the artifact)"
+              status=1
+            fi
+            tail -5 "$OUT/$nb.log"
+            echo "::endgroup::"
+          done
+          cp -r ../docs/figures "$OUT/figures" 2>/dev/null || echo "no figure exported"
+          exit $status
+
+      - name: Upload the executed notebooks and the figures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: opdi-notebooks-${{ github.run_number }}
+          path: ${{ runner.temp }}/notebooks/
           retention-days: 7
           if-no-files-found: warn
