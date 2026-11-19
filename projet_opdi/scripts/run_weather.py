@@ -14,7 +14,7 @@ project_dir = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_dir / "src"))
 
 from opdi_pipeline.config import Settings, load_settings
-from opdi_pipeline.spark import get_spark_session
+from opdi_pipeline.spark import get_spark
 from opdi_pipeline.weather import run_weather_pipeline
 
 
@@ -29,7 +29,7 @@ def main():
     print(f"Data root: {settings.data_root}")
     print(f"Scope: {settings.start} -> {settings.end}")
 
-    spark = get_spark_session(settings)
+    spark = get_spark(settings)
     try:
         results = run_weather_pipeline(spark, settings, stations=args.stations)
         print("\nWeather Pipeline Finished Successfully!")
