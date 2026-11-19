@@ -374,7 +374,7 @@ def train_and_evaluate_weather_gbt(spark, enriched_arrivals_df, settings: Settin
     # Harmonize column names and types
     prepped = (
         df
-        .withColumn("day_of_week", F.dayofweek(F.col("landing_utc")).cast(DoubleType()))
+        .withColumn("day_of_week", F.col("day_of_week").cast(DoubleType()))
         .withColumn("arrival_hour", F.col("arrival_hour").cast(DoubleType()))
         .withColumn("hourly_demand", F.coalesce(F.col("hourly_demand"), F.lit(10.0)).cast(DoubleType()))
         .withColumn("prev_hourly_demand", F.coalesce(F.col("prev_hourly_demand"), F.col("hourly_demand")).cast(DoubleType()))
