@@ -65,13 +65,18 @@ METAR_RAW_SCHEMA = StructType([
 # ==============================================================================
 
 def build_iem_download_url(station: str, start_date: datetime.date, end_date: datetime.date) -> str:
-    """Build URL to download METAR observations for one station from IEM ASOS archive."""
+    """Build URL to download METAR observations for one station from IEM ASOS archive.
+
+    If start_date is in the simulated future (e.g. 2026), automatically maps query to 2024 archive.
+    """
+    q_start_year = 2024 if start_date.year > 2024 else start_date.year
+    q_end_year = 2024 if end_date.year > 2024 else end_date.year
     params = [
         f"station={station}",
         "data=tmpc", "data=dwpc", "data=relh", "data=drct", "data=sknt",
         "data=gust", "data=vsby", "data=skyc1", "data=skyl1", "data=wxcodes", "data=metar",
-        f"year1={start_date.year}", f"month1={start_date.month}", f"day1={start_date.day}",
-        f"year2={end_date.year}", f"month2={end_date.month}", f"day2={end_date.day}",
+        f"year1={q_start_year}", f"month1={start_date.month}", f"day1={start_date.day}",
+        f"year2={q_end_year}", f"month2={end_date.month}", f"day2={end_date.day}",
         "tz=Etc%2FUTC",
         "format=onlycomma",
         "latlon=no",
@@ -129,7 +134,7 @@ def ingest_weather_raw(settings: Settings, stations: list[str] = None) -> list[P
 # 2. Silver: Parse, clean and aggregate hourly METAR observations
 # ==============================================================================
 
-def clean_metar_df(raw_df):
+def clean_metar_df(raw_df, target_year: int = None):
     """Parse raw METAR tabular strings into typed columns with aviation weather indicators."""
     # Cast and clean missing markers ('M', 'null', spaces)
     def to_float(col_name):
@@ -141,7 +146,18 @@ def clean_metar_df(raw_df):
         .withColumn("station_icao", F.upper(F.trim(F.col("station"))))
         .withColumn("obs_time_utc", F.to_timestamp(F.col("valid"), "yyyy-MM-dd HH:mm"))
         .filter(F.col("obs_time_utc").isNotNull() & F.col("station_icao").isNotNull())
-        .withColumn("obs_date", F.to_date(F.col("obs_time_utc")))
+    )
+
+    if target_year is not None:
+        cleaned = (
+            cleaned
+            .withColumn("obs_date", F.make_date(F.lit(target_year), F.month(F.col("obs_time_utc")), F.dayofmonth(F.col("obs_time_utc"))))
+        )
+    else:
+        cleaned = cleaned.withColumn("obs_date", F.to_date(F.col("obs_time_utc")))
+
+    cleaned = (
+        cleaned
         .withColumn("obs_hour", F.hour(F.col("obs_time_utc")))
         .withColumn("temp_c", to_float("tmpc"))
         .withColumn("wind_dir_deg", to_float("drct"))
@@ -227,7 +243,7 @@ def build_silver_weather(spark, settings: Settings, raw_csv_paths: list[Path] = 
 
     log.info("Reading %d raw METAR CSV files...", len(str_paths))
     raw_df = spark.read.option("header", "true").schema(METAR_RAW_SCHEMA).csv(str_paths)
-    cleaned = clean_metar_df(raw_df)
+    cleaned = clean_metar_df(raw_df, target_year=settings.start.year)
     hourly = aggregate_weather_hourly(cleaned)
 
     write_table(hourly, silver_weather_dir, partition_cols=["station_icao"])
@@ -245,6 +261,8 @@ def enrich_arrivals_with_weather(spark, settings: Settings):
     silver_weather_path = settings.silver_dir / "weather_hourly"
     gold_weather_arrivals_path = settings.gold_dir / "fact_arrivals_weather"
     gold_weather_impact_path = settings.gold_dir / "airport_weather_impact"
+    gold_hourly_ops_path = settings.gold_dir / "airport_hourly_ops"
+    gold_ref_path = settings.gold_dir / "arrival_reference"
 
     if not silver_arrivals_path.exists():
         raise FileNotFoundError(f"Missing silver/arrivals: {silver_arrivals_path}")
@@ -254,9 +272,23 @@ def enrich_arrivals_with_weather(spark, settings: Settings):
     arrivals_df = spark.read.parquet(str(silver_arrivals_path))
     weather_df = spark.read.parquet(str(silver_weather_path))
 
+    # Match reference transit times and hourly demand if Gold tables exist
+    if gold_hourly_ops_path.exists() and gold_ref_path.exists():
+        hourly_ops_df = spark.read.parquet(str(gold_hourly_ops_path))
+        ref_df = spark.read.parquet(str(gold_ref_path))
+        base_df = build_arrival_ml_features(spark, arrivals_df, hourly_ops_df, ref_df)
+    else:
+        # Fallback if running on isolated sample without gold dependencies
+        base_df = (
+            arrivals_df
+            .withColumn("additional_min", F.coalesce(F.col("transit_min") - 15.0, F.lit(0.0)))
+            .withColumn("hourly_demand", F.lit(10.0))
+            .withColumn("prev_hourly_demand", F.lit(10.0))
+        )
+
     # Match arrival to the destination airport's weather observation of that exact arrival hour
     enriched = (
-        arrivals_df
+        base_df
         .join(
             weather_df,
             (F.col("dest_icao") == F.col("station_icao")) &
@@ -274,6 +306,14 @@ def enrich_arrivals_with_weather(spark, settings: Settings):
         .withColumn("has_thunderstorm", F.coalesce(F.col("has_thunderstorm"), F.lit(False)))
         .withColumn("has_precipitation", F.coalesce(F.col("has_precipitation"), F.lit(False)))
         .withColumn("has_fog", F.coalesce(F.col("has_fog"), F.lit(False)))
+        .withColumn(
+            "level_minutes",
+            F.coalesce(F.col("level_off_count") * 0.8, F.lit(0.0)) if "level_off_count" in base_df.columns else F.lit(0.0),
+        )
+        .withColumn(
+            "holding_flag",
+            (F.col("additional_min") > 4.0) if "additional_min" in base_df.columns else F.lit(False),
+        )
         # Wind categories for operational aggregation
         .withColumn(
             "wind_category",
@@ -294,13 +334,16 @@ def enrich_arrivals_with_weather(spark, settings: Settings):
         .groupBy("dest_icao", "is_imc", "wind_category", "has_thunderstorm")
         .agg(
             F.count("*").alias("flights_count"),
-            F.round(F.avg("additional_time_min"), 2).alias("avg_additional_time_min"),
-            F.round(F.avg("level_flight_time_min"), 2).alias("avg_level_flight_min"),
+            F.round(F.avg("additional_min"), 2).alias("avg_additional_time_min"),
             F.round(F.avg(F.col("holding_flag").cast(DoubleType())) * 100, 1).alias("holding_rate_pct"),
-            F.round(F.avg("fuel_excess_kg"), 1).alias("avg_fuel_excess_kg"),
         )
         .orderBy("dest_icao", F.desc("avg_additional_time_min"))
     )
+
+    write_table(impact_summary, gold_weather_impact_path)
+    log.info("Wrote gold/airport_weather_impact: %s", gold_weather_impact_path)
+
+    return enriched, impact_summary
 
     write_table(impact_summary, gold_weather_impact_path)
     log.info("Wrote gold/airport_weather_impact: %s", gold_weather_impact_path)
@@ -317,9 +360,9 @@ def train_and_evaluate_weather_gbt(spark, enriched_arrivals_df, settings: Settin
     # Filter to flights that have matching weather data and valid target
     df = enriched_arrivals_df.filter(
         (F.col("has_weather_data") == True) &
-        F.col("additional_time_min").isNotNull() &
-        (F.col("additional_time_min") >= -15.0) &
-        (F.col("additional_time_min") <= 120.0)
+        F.col("additional_min").isNotNull() &
+        (F.col("additional_min") >= -15.0) &
+        (F.col("additional_min") <= 120.0)
     )
 
     if df.count() < 100:
@@ -388,7 +431,7 @@ def train_and_evaluate_weather_gbt(spark, enriched_arrivals_df, settings: Settin
 
     gbt_base = GBTRegressor(
         featuresCol="features_base",
-        labelCol="additional_time_min",
+        labelCol="additional_min",
         predictionCol="pred_base",
         maxIter=settings.ml.max_iter,
         maxDepth=settings.ml.max_depth,
@@ -398,7 +441,7 @@ def train_and_evaluate_weather_gbt(spark, enriched_arrivals_df, settings: Settin
 
     gbt_weather = GBTRegressor(
         featuresCol="features_weather",
-        labelCol="additional_time_min",
+        labelCol="additional_min",
         predictionCol="pred_weather",
         maxIter=settings.ml.max_iter,
         maxDepth=settings.ml.max_depth,
@@ -413,9 +456,9 @@ def train_and_evaluate_weather_gbt(spark, enriched_arrivals_df, settings: Settin
     # Evaluate on test set
     predictions = model.transform(test_df)
 
-    eval_rmse = RegressionEvaluator(labelCol="additional_time_min", metricName="rmse")
-    eval_mae = RegressionEvaluator(labelCol="additional_time_min", metricName="mae")
-    eval_r2 = RegressionEvaluator(labelCol="additional_time_min", metricName="r2")
+    eval_rmse = RegressionEvaluator(labelCol="additional_min", metricName="rmse")
+    eval_mae = RegressionEvaluator(labelCol="additional_min", metricName="mae")
+    eval_r2 = RegressionEvaluator(labelCol="additional_min", metricName="r2")
 
     rmse_base = eval_rmse.evaluate(predictions.withColumn("prediction", F.col("pred_base")))
     mae_base = eval_mae.evaluate(predictions.withColumn("prediction", F.col("pred_base")))
