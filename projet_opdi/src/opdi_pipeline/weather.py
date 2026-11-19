@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import time
 import urllib.request
 from pathlib import Path
 
@@ -124,6 +125,7 @@ def ingest_weather_raw(settings: Settings, stations: list[str] = None) -> list[P
             success = download_metar_csv(station, settings.start, settings.end, csv_file)
             if success:
                 saved_files.append(csv_file)
+            time.sleep(2.5)  # Be polite to IEM ASOS archive endpoint
         else:
             log.info("Using cached raw METAR for %s: %s", station, csv_file)
             saved_files.append(csv_file)
@@ -261,7 +263,7 @@ def enrich_arrivals_with_weather(spark, settings: Settings):
     silver_weather_path = settings.silver_dir / "weather_hourly"
     gold_weather_arrivals_path = settings.gold_dir / "fact_arrivals_weather"
     gold_weather_impact_path = settings.gold_dir / "airport_weather_impact"
-    gold_hourly_ops_path = settings.gold_dir / "airport_hourly_ops"
+    gold_hourly_ops_path = settings.gold_dir / "airport_arrival_hourly"
     gold_ref_path = settings.gold_dir / "arrival_reference"
 
     if not silver_arrivals_path.exists():
