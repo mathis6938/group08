@@ -39,6 +39,33 @@ def test_source_files_of_the_prod_scope():
     assert "flight_events_20260530_20260609.parquet" in names and "measurements_20260719_20260729.parquet" in names
     assert names[-2:] == ["airports.csv", "runways.csv"]
     assert len(files) == 2 + 6 + 6 + 2
+    names = [n for _, n, _ in ingestion.source_files(load_settings("prod", weather_stations="LFBO,EGLL"))]
+    assert names[-4:] == ["metar_LFBO_20260601_20260729.csv", "metar_EGLL_20260601_20260729.csv",   # real period
+                          "airports.csv", "runways.csv"]
+
+
+def test_weather_query_covers_the_real_period():
+    """The METAR of the scope itself (2026), never another year; the end date is exclusive, as in the archive."""
+    url = ingestion.weather_url(load_settings("prod"), "EGLL")
+    assert url.startswith("https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=EGLL&")
+    for part in ("year1=2026", "month1=6", "day1=1", "year2=2026", "month2=7", "day2=29", "tz=Etc%2FUTC",
+                 "data=vsby", "data=skyc4", "data=wxcodes", "format=onlycomma"):
+        assert part in url, part
+
+
+def test_weather_stations_override():
+    assert load_settings("dev", weather_stations="").weather.stations == ()
+    assert load_settings("dev", weather_stations="lfbo, EGLL").weather.stations == ("LFBO", "EGLL")
+    assert [n for t, n, _ in ingestion.source_files(load_settings("dev", weather_stations="LFBO"))
+            if t == "weather"] == ["metar_LFBO_20260609_20260619.csv"]
+
+
+def test_data_rows_ignores_header_and_comments(tmp_path):
+    f = tmp_path / "m.csv"
+    f.write_text("#DEBUG: query\nstation,valid\nLFBO,2026-06-09 00:00\nLFBO,2026-06-09 00:30\n")
+    assert ingestion.data_rows(f) == 2
+    f.write_text("station,valid\n")
+    assert ingestion.data_rows(f) == 0
 
 
 @pytest.fixture
@@ -85,7 +112,8 @@ def test_republished_files_are_downloaded_again(http_site, tmp_path):
     (site / "airports.csv").write_text("ident\nLFBO\n")
     (site / "runways.csv").write_text("airport_ident\nLFBO\n")
     settings = load_settings("dev", data_root=str(tmp_path / "data"), base_url=f"{url}/opdi", pause_s=0,
-                             airports_url=f"{url}/airports.csv", runways_url=f"{url}/runways.csv")
+                             airports_url=f"{url}/airports.csv", runways_url=f"{url}/runways.csv",
+                             weather_stations="")
 
     assert ingestion.run(settings)["results"] == {"downloaded": 5}
     assert ingestion.run(settings)["results"] == {"already_present": 5}

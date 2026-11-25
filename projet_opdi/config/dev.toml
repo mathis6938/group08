@@ -54,3 +54,17 @@ demand_cap_pctl  = 0.90    # percentile threshold for demand capping scenario
 typology_min_coverage_pct = 30.0    # airports in the typology: arrival time measured for >= 30 % of arrivals
 
 
+
+[weather]
+# METAR observations (Iowa Environmental Mesonet archive of the airport weather reports, free, no API key) of the
+# destination airports listed in `stations` (ICAO codes), for the real period of the scope. Empty: no weather.
+base_url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+stations = []
+pause_s  = 2.0                  # pause after each download (public archive)
+# Weather conditions of an observation
+vmc_visibility_m  = 5000.0      # ICAO Annex 2 (VFR in a control zone): visibility >= 5 km and ...
+vmc_ceiling_ft    = 1500.0      # ... ceiling >= 1 500 ft; below either one: instrument conditions (IMC)
+cat1_visibility_m = 800.0       # ICAO CAT I approach: visibility >= 800 m and ...
+cat1_ceiling_ft   = 200.0       # ... decision height >= 200 ft; below either one: low-visibility operations
+strong_wind_kt    = 20.0        # strong wind (our threshold): mean wind >= 20 kt or ...
+strong_gust_kt    = 30.0        # ... gusts >= 30 kt

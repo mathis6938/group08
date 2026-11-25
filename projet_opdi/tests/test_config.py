@@ -39,3 +39,14 @@ def test_invalid_settings():
         load_settings("staging")
     with pytest.raises(ValueError):
         load_settings("dev", start="2026-06-19", end="2026-06-09")
+
+
+def test_weather_settings(monkeypatch):
+    prod = load_settings("prod")
+    assert (prod.weather.vmc_visibility_m, prod.weather.vmc_ceiling_ft) == (5000.0, 1500.0)     # ICAO VFR minima
+    assert (prod.weather.cat1_visibility_m, prod.weather.cat1_ceiling_ft) == (800.0, 200.0)     # ICAO CAT I
+    monkeypatch.setenv("OPDI_WEATHER_STATIONS", "LFBO,EGLL")
+    monkeypatch.setenv("OPDI_WEATHER_URL", "http://127.0.0.1:1/iem/asos.py")
+    s = load_settings("dev")
+    assert s.weather.stations == ("LFBO", "EGLL") and s.weather.base_url.startswith("http://127.0.0.1")
+    assert load_settings("dev", weather_stations="ENZV").weather.stations == ("ENZV",)   # argument > environment
