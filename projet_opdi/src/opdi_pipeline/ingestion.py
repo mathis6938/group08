@@ -24,6 +24,8 @@ from .config import PARQUET_TABLES
 
 OK_RESULTS = ("downloaded", "already_present", "republished")
 WEATHER_TABLE = "weather"
+WEATHER_MAX_FAILURES = 3        # METAR downloads failed in a row: archive unreachable, other stations skipped
+WEATHER_TIMEOUT_S = 60
 # METAR fields requested from the archive (the CSV header has exactly these columns: see schemas.RAW["metar"])
 METAR_FIELDS = ("tmpc", "dwpc", "relh", "drct", "sknt", "gust", "vsby", "skyc1", "skyc2", "skyc3", "skyc4",
                 "skyl1", "skyl2", "skyl3", "skyl4", "wxcodes", "metar")
@@ -106,13 +108,13 @@ def head(url, user_agent="UiS-DAT535-group08"):
         return type(e).__name__, 0, ""
 
 
-def download(url, dest, retries=3, user_agent="UiS-DAT535-group08", wait_s=5):
+def download(url, dest, retries=3, user_agent="UiS-DAT535-group08", wait_s=5, timeout=300):
     """Download to a temporary .part file, then rename: an interrupted download never leaves a partial file."""
     tmp = dest.with_name(dest.name + ".part")
     for attempt in range(1, retries + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-            with urllib.request.urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
+            with urllib.request.urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
                 shutil.copyfileobj(r, f, 1 << 20)                  # 1 MB chunks
             os.replace(tmp, dest)
             return "downloaded"
@@ -160,6 +162,7 @@ def run(settings):
              settings.start, settings.end, len(files), settings.raw_dir, free_gb(settings.raw_dir))
     rows = []
     previous = last_manifest_entries(settings)
+    weather_failures = 0                                           # METAR downloads failed in a row
     with steps.step("download"):
         for i, (table, name, url) in enumerate(files, 1):
             dest = settings.raw_dir / table / name
@@ -168,11 +171,17 @@ def run(settings):
                 status, size, last_modified = "", 0, ""
                 if dest.exists():
                     result = "already_present"
+                elif weather_failures >= WEATHER_MAX_FAILURES:       # the weather never blocks the OPDI pipeline
+                    result = "skipped"
                 elif free_gb(settings.raw_dir) < settings.min_free_gb:
                     log.error("STOP: insufficient free space before %s", name)
                     break
                 else:
-                    result = download(url, dest, settings.retries, settings.user_agent)
+                    result = download(url, dest, settings.retries, settings.user_agent, timeout=WEATHER_TIMEOUT_S)
+                    weather_failures = weather_failures + 1 if result == "failed" else 0
+                    if weather_failures == WEATHER_MAX_FAILURES:
+                        log.error("METAR archive unreachable (%d downloads failed in a row): other stations skipped",
+                                  weather_failures)
                     if result == "downloaded" and data_rows(dest) == 0:     # unknown station or no report
                         dest.unlink()
                         result = "empty"

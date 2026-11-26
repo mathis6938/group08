@@ -38,10 +38,8 @@ def test_source_files_of_the_prod_scope():
     assert names[:2] == ["flight_list_202606.parquet", "flight_list_202607.parquet"]
     assert "flight_events_20260530_20260609.parquet" in names and "measurements_20260719_20260729.parquet" in names
     assert names[-2:] == ["airports.csv", "runways.csv"]
-    assert len(files) == 2 + 6 + 6 + 2
-    names = [n for _, n, _ in ingestion.source_files(load_settings("prod", weather_stations="LFBO,EGLL"))]
-    assert names[-4:] == ["metar_LFBO_20260601_20260729.csv", "metar_EGLL_20260601_20260729.csv",   # real period
-                          "airports.csv", "runways.csv"]
+    assert "metar_LFBO_20260601_20260729.csv" in names              # weather of the real period of the scope
+    assert len(files) == 2 + 6 + 6 + 34 + 2
 
 
 def test_weather_query_covers_the_real_period():
@@ -128,3 +126,23 @@ def test_republished_files_are_downloaded_again(http_site, tmp_path):
     assert (settings.raw_dir / "flight_events" / events.name).read_bytes() == b"v2" * 150
     latest = ingestion.last_manifest_entries(settings)
     assert latest[events.name]["sha256"] == hashlib.sha256(b"v2" * 150).hexdigest()   # lineage of the new version
+
+
+def test_unreachable_weather_archive_never_blocks_the_ingestion(http_site, tmp_path):
+    """After a few METAR downloads failed in a row, the other stations are skipped; the OPDI files are downloaded."""
+    site, url = http_site
+    for table, name in [("flight_list", "flight_list_202606.parquet"),
+                        ("flight_events", "flight_events_20260609_20260619.parquet"),
+                        ("measurements", "measurements_20260609_20260619.parquet")]:
+        (site / "opdi" / table).mkdir(parents=True)
+        (site / "opdi" / table / name).write_bytes(b"v1" * 100)
+    (site / "airports.csv").write_text("ident\nLFBO\n")
+    (site / "runways.csv").write_text("airport_ident\nLFBO\n")
+    settings = load_settings("dev", data_root=str(tmp_path / "data"), base_url=f"{url}/opdi", pause_s=0, retries=1,
+                             airports_url=f"{url}/airports.csv", runways_url=f"{url}/runways.csv",
+                             weather_base_url=f"{url}/no-archive/asos.py", weather_pause_s=0,
+                             weather_stations="LFBO,LFPG,EGLL,ENZV,EDDF")
+    report = ingestion.run(settings)
+    assert report["results"] == {"failed": ingestion.WEATHER_MAX_FAILURES, "downloaded": 5,
+                                 "skipped": 5 - ingestion.WEATHER_MAX_FAILURES}
+    assert not (settings.raw_dir / "weather").exists() or not any((settings.raw_dir / "weather").iterdir())

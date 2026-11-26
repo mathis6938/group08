@@ -57,9 +57,13 @@ typology_min_coverage_pct = 30.0    # airports in the typology: arrival time mea
 
 [weather]
 # METAR observations (Iowa Environmental Mesonet archive of the airport weather reports, free, no API key) of the
-# destination airports listed in `stations` (ICAO codes), for the real period of the scope. Empty: no weather.
+# destination airports: the 30 airports with the most measured arrivals in the production run prod-8, plus the focus
+# airports outside that list (LFPG, EGLL, LFBO, ENZV). The real period of the scope is downloaded.
 base_url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-stations = []
+stations = ["EDDF", "LEBL", "EHAM", "LEMD", "EGKK", "LSZH", "LOWW", "LGAV", "LFPO", "LPPT",
+            "EGCC", "EBBR", "LFMN", "LIMC", "EIDW", "EPWA", "ESSA", "LKPR", "EDDB", "LHBP",
+            "EGPH", "EDDM", "LEIB", "EKCH", "EDDK", "EDDH", "ENGM", "EFHK", "LIML", "LYBE",
+            "LFPG", "EGLL", "LFBO", "ENZV"]
 pause_s  = 2.0                  # pause after each download (public archive)
 # Weather conditions of an observation
 vmc_visibility_m  = 5000.0      # ICAO Annex 2 (VFR in a control zone): visibility >= 5 km and ...

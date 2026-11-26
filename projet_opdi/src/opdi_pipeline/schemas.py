@@ -3,6 +3,7 @@
 - RAW: schema of the OPDI v0.0.2 files of 2026. Bronze compares every raw file with it, so a schema change at the
   source (e.g. the `decimal` ids and `timestamp_ntz` dates of 2025) stops the run before Silver, instead of
   producing wrong data. A new variant then needs a mapping in silver.standardize_* and a new contract.
+- RAW["metar"]: header of the METAR CSV files of the weather archive (every column read as text).
 - SILVER, GOLD: schema of the published tables. Silver and Gold check their written tables against them, and the
   tests check them too, so that a code change cannot silently change what downstream consumers read.
 """
@@ -18,6 +19,9 @@ RAW = {
         "latitude": "double", "altitude": "double", "source": "string", "version": "string", "info": "string"},
     "measurements": {
         "id": "bigint", "event_id": "bigint", "type": "string", "value": "double", "version": "string"},
+    "metar": {c: "string" for c in ("station", "valid", "tmpc", "dwpc", "relh", "drct", "sknt", "gust", "vsby",
+                                    "skyc1", "skyc2", "skyc3", "skyc4", "skyl1", "skyl2", "skyl3", "skyl4",
+                                    "wxcodes", "metar")},
 }
 
 SILVER = {

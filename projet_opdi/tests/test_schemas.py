@@ -32,6 +32,14 @@ def test_published_tables_have_a_contract():
     }
 
 
+def test_metar_contract_is_the_archive_header():
+    """The METAR CSV header is the list of fields requested from the archive (ingestion.METAR_FIELDS)."""
+    from opdi_pipeline import ingestion
+    from synthetic_opdi import METAR_HEADER
+    assert list(schemas.RAW["metar"]) == ["station", "valid", *ingestion.METAR_FIELDS] == METAR_HEADER
+    assert set(schemas.RAW["metar"].values()) == {"string"}
+
+
 def test_schema_change_at_the_source_is_detected(spark, tmp_path):
     """A raw file with the 2025 schema (decimal ids, timestamps, extra column) does not match the contract."""
     settings = load_settings("dev", data_root=str(tmp_path))

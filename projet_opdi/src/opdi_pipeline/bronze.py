@@ -4,6 +4,9 @@ and reconciliation of the row counts between raw/ and bronze/.
 The build is incremental: bronze/_state.json keeps the SHA-256 of the source file behind every Bronze period, and
 only new or republished files are (re)written, each one replacing its own partition. The reconciliation always
 checks every file of the scope. --full-refresh rebuilds everything (e.g. after a change of the Bronze code).
+
+Weather: the METAR CSV files (raw/weather/) become bronze/metar, every column kept as text, partitioned by station
+(one source file per station), with the same schema contract, lineage, incremental build and reconciliation.
 """
 import csv
 import hashlib
@@ -20,6 +23,7 @@ from .common import QualityGateError, Steps, free_gb, log, parquet_gb, utc_now, 
 from .config import PARQUET_TABLES
 
 STATE_FILE = "_state.json"
+WEATHER_TABLE, METAR_TABLE = ingestion.WEATHER_TABLE, "metar"     # raw/weather/*.csv -> bronze/metar
 PERIOD_PATTERN = r"_(\d{6,8})(?:_\d{8})?\.parquet$"      # flight_list_202606 / flight_events_20260609_20260619
 
 LINEAGE_COLUMNS = ["_source_file", "_source_period", "_ingestion_run_id", "_ingested_at_utc",
@@ -29,6 +33,17 @@ LINEAGE_COLUMNS = ["_source_file", "_source_period", "_ingestion_run_id", "_inge
 def read_reference_csv(spark, path):
     """OurAirports CSV: header, quoted fields that may contain commas and line breaks; every column kept as text."""
     return spark.read.option("header", True).option("multiLine", True).option("escape", '"').csv(str(path))
+
+
+def read_metar_csv(spark, paths):
+    """METAR CSV of the weather archive: header, possible '#' comment lines; every column kept as text."""
+    paths = [str(p) for p in (paths if isinstance(paths, (list, tuple)) else [paths])]
+    return spark.read.option("header", True).option("comment", "#").csv(paths)
+
+
+def metar_station(file_name):
+    """Station of a METAR file: metar_<ICAO>_<start>_<end>.csv."""
+    return file_name.split("_")[1]
 
 
 # ---------------------------------------------------------------------------------------------- schemas
@@ -53,6 +68,18 @@ def check_schemas(spark, settings):
                              checked_at_utc=utc_now().isoformat(timespec="seconds")))
             for p in problems:
                 log.error("  %s does not match the schema contract of %s: %s", path.name, table, p)
+
+    for path in sorted((settings.raw_dir / WEATHER_TABLE).glob("metar_*.csv")):   # METAR CSV: header vs contract
+        df = read_metar_csv(spark, path)
+        schema = tuple((f.name, f.dataType.simpleString()) for f in df.schema.fields)
+        fingerprint = hashlib.sha256(str(schema).encode()).hexdigest()[:12]
+        variants[WEATHER_TABLE][schema].append(path.name)
+        problems = schemas.compare(df.schema, schemas.RAW[METAR_TABLE])
+        rows.append(dict(table=WEATHER_TABLE, file=path.name, n_rows=df.count(), n_columns=len(schema),
+                         schema_fingerprint=fingerprint, matches_contract=not problems,
+                         checked_at_utc=utc_now().isoformat(timespec="seconds")))
+        for p in problems:
+            log.error("  %s does not match the schema contract of %s: %s", path.name, METAR_TABLE, p)
 
     for table, by_schema in variants.items():
         keys = list(by_schema)
@@ -111,6 +138,8 @@ def bronze_location(settings, table, file_name):
     """Folder holding the Bronze rows of one source file: its partition, or the whole table for a reference CSV."""
     if table == "reference":
         return settings.bronze_dir / Path(file_name).stem
+    if table == WEATHER_TABLE:
+        return settings.bronze_dir / METAR_TABLE / f"station={metar_station(file_name)}"
     return settings.bronze_dir / table / f"_source_period={re.search(PERIOD_PATTERN, file_name).group(1)}"
 
 
@@ -141,6 +170,12 @@ def build_tables(spark, settings, files):
             .partitionBy("_source_period")
             .parquet(str(settings.bronze_dir / table)))
         log.info("%-13s -> %s (%d file(s))", table, settings.bronze_dir / table, len(files[table]))
+    if files.get(WEATHER_TABLE):                                   # METAR: one partition per station (= per file)
+        (add_lineage(read_metar_csv(spark, files[WEATHER_TABLE]), lineage, settings.run_id).drop("_source_period")
+            .write.mode("overwrite")                               # dynamic: only the stations written are replaced
+            .partitionBy("station")
+            .parquet(str(settings.bronze_dir / METAR_TABLE)))
+        log.info("%-13s -> %s (%d file(s))", METAR_TABLE, settings.bronze_dir / METAR_TABLE, len(files[WEATHER_TABLE]))
     for path in files.get("reference", []):                        # airports, runways: every column kept as text
         table = Path(path).stem
         (add_lineage(read_reference_csv(spark, path), lineage, settings.run_id).drop("_source_period")
@@ -159,7 +194,7 @@ def save_state(settings, files):
 def reconcile(spark, settings, files):
     """Every raw row must be in Bronze, with its lineage: row counts compared file by file."""
     expected = {}
-    with open(settings.schema_report_path, newline="") as f:      # Parquet files: counted by check_schemas
+    with open(settings.schema_report_path, newline="") as f:      # Parquet and METAR files: counted by check_schemas
         for r in csv.DictReader(f):
             expected[r["file"]] = int(r["n_rows"])
     for path in files.get("reference", []):                        # CSV files: counted directly
@@ -167,7 +202,9 @@ def reconcile(spark, settings, files):
 
     scope = [Path(p).name for paths in files.values() for p in paths]
     recon = []
-    for table in list(PARQUET_TABLES) + [Path(p).stem for p in files.get("reference", [])]:
+    tables = list(PARQUET_TABLES) + [Path(p).stem for p in files.get("reference", [])]
+    tables += [METAR_TABLE] if files.get(WEATHER_TABLE) else []     # METAR files: counted by check_schemas
+    for table in tables:
         stats = (spark.read.parquet(str(settings.bronze_dir / table))
                  .filter(col("_source_file").isin(scope))         # periods of another scope are kept, not checked
                  .groupBy("_source_file")
@@ -196,7 +233,15 @@ def run(spark, settings):
         raise QualityGateError(f"no raw file of the scope in {settings.raw_dir}: run the ingest layer first")
     with steps.step("schema check"):
         variants, schema_rows = check_schemas(spark, settings)
-    off_contract = [r["file"] for r in schema_rows if not r["matches_contract"]]
+    # The weather is an enrichment: a METAR file off its contract is left out of Bronze (and reported), it never
+    # stops the OPDI pipeline. An OPDI file off its contract stops the run.
+    weather_off_contract = [r["file"] for r in schema_rows if not r["matches_contract"] and r["table"] == WEATHER_TABLE]
+    if weather_off_contract:
+        log.error("METAR file(s) off the schema contract, left out of Bronze: %s", weather_off_contract)
+        files[WEATHER_TABLE] = [p for p in files.get(WEATHER_TABLE, []) if Path(p).name not in weather_off_contract]
+        if not files[WEATHER_TABLE]:
+            del files[WEATHER_TABLE]
+    off_contract = [r["file"] for r in schema_rows if not r["matches_contract"] and r["table"] != WEATHER_TABLE]
     if off_contract:
         write_report(settings, "bronze", dict(reconciliation_passed=False, schema_variants=variants,
                                               files_off_contract=off_contract, durations_s=steps.durations))
@@ -222,6 +267,7 @@ def run(spark, settings):
         (settings.bronze_dir / STATE_FILE).unlink(missing_ok=True)
     report = write_report(settings, "bronze", dict(
         reconciliation_passed=passed, schema_variants=variants, files_off_contract=[],
+        weather_files_off_contract=weather_off_contract,
         files_built=built, files_up_to_date=n_files - len(built), full_refresh=settings.full_refresh,
         files_reconciled=len(recon),
         files_expected=n_expected, rows=total, size_gb=round(size, 3), reconciliation=recon,
