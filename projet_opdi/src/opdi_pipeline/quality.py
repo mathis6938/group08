@@ -6,7 +6,7 @@ import os
 from .common import free_gb, log, parquet_gb, read_report, table_rows, utc_now, write_report
 
 LAYER_TABLES = [
-    ("Bronze", "bronze_dir", ["flight_list", "flight_events", "measurements", "airports", "runways"]),
+    ("Bronze", "bronze_dir", ["flight_list", "flight_events", "measurements", "airports", "runways", "metar"]),
     ("Silver", "silver_dir", ["flights", "flight_events", "airports", "runways", "arrivals", "descent_level_offs"]),
     ("Quarantine", "quarantine_dir", ["flights", "flight_events"]),
     ("Gold", "gold_dir", ["airport_hourly_ops", "airport_daily_ops", "runway_usage", "airport_ground_times",

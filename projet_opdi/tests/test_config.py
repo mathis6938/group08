@@ -43,6 +43,7 @@ def test_invalid_settings():
 
 def test_weather_settings(monkeypatch):
     prod = load_settings("prod")
+    assert len(prod.weather.stations) == 34 and {"LFPG", "EGLL", "LFBO", "ENZV", "EDDF"} <= set(prod.weather.stations)
     assert (prod.weather.vmc_visibility_m, prod.weather.vmc_ceiling_ft) == (5000.0, 1500.0)     # ICAO VFR minima
     assert (prod.weather.cat1_visibility_m, prod.weather.cat1_ceiling_ft) == (800.0, 200.0)     # ICAO CAT I
     monkeypatch.setenv("OPDI_WEATHER_STATIONS", "LFBO,EGLL")
