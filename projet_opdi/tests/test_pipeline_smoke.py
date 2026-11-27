@@ -215,9 +215,10 @@ def test_gold_figures(pipeline_run, spark):
 
 
 @pytest.mark.slow
-def test_weather_ingested_into_bronze(pipeline_run, spark):
+def test_weather_through_bronze_and_silver(pipeline_run, spark):
     """METAR of the synthetic stations: downloaded for the real period, every row in Bronze with its lineage, one
-    partition per station; an unknown station (header only) is not kept."""
+    partition per station (an unknown station, header only, is not kept); Silver with quarantine, deduplication and
+    the weather conditions read from the present-weather codes."""
     data_root, _, exp, _ = pipeline_run
     w = exp["weather"]
     ingest = report(data_root, RUN_ID, "ingest")
@@ -233,7 +234,26 @@ def test_weather_ingested_into_bronze(pipeline_run, spark):
     assert {r[0] for r in bronze.select("station").distinct().collect()} == set(w["stations"])
     recon = [r for r in report(data_root, RUN_ID, "bronze")["reconciliation"] if r["table"] == "metar"]
     assert len(recon) == len(w["stations"]) and all(r["raw_rows"] == r["bronze_rows"] for r in recon)
+
+    silver = read(spark, data_root / "silver" / "weather_observations")
+    assert silver.count() == w["silver"]
+    assert silver.select("station_icao", "obs_time_utc").distinct().count() == w["silver"]   # deduplicated
+    q = read(spark, data_root / "quarantine" / "weather_observations")
+    assert {r[0]: r[1] for r in q.groupBy("_quarantine_reason").count().collect()} == w["quarantine"]
+    acc = report(data_root, RUN_ID, "silver")["row_accounting"]["weather_observations"]
+    assert (acc["out_of_scope"], acc["duplicates"]) == (w["out_of_scope"], w["duplicates"])
+    # present weather read token by token: VCSH (vicinity) is not precipitation, BR (mist) is not fog,
+    # a TSRA in the TEMPO forecast of the raw METAR is not a thunderstorm
+    lfpg = silver.filter("station_icao = 'LFPG'")
+    assert lfpg.filter("present_weather = 'VCSH' AND has_precipitation").count() == 0
+    assert lfpg.filter("present_weather = 'BR' AND (has_fog OR is_imc)").count() == 0
+    assert lfpg.filter("raw_metar LIKE '%TEMPO TSRA%' AND has_thunderstorm").count() == 0
+    assert silver.filter("ceiling_ft = 1200").count() == 4               # lowest BKN layer, not the FEW layer below
+
     summary = json.loads((data_root / "pipeline_summary.json").read_text())
+    assert summary["weather"]["stations_with_data"] == len(w["stations"])
+    assert summary["weather"]["observations"] == w["silver"]
+    assert summary["weather"]["warnings"] == ["no observation for ['ZZZZ']"]
     assert [t["rows"] for t in summary["tables"] if (t["layer"], t["table"]) == ("Bronze", "metar")] == [w["bronze"]]
 
 

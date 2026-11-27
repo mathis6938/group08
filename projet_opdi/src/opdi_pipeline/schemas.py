@@ -68,6 +68,14 @@ SILVER = {
         "start_lat": "double", "start_lon": "double", "end_lat": "double", "end_lon": "double",
         "distance_flown_km": "double", "displacement_km": "double", "is_holding": "boolean",
         "segments_merged": "bigint", "_silver_processed_at_utc": "timestamp"},
+    "weather_observations": {
+        "station_icao": "string", "obs_time_utc": "timestamp", "obs_date": "date", "obs_hour": "int",
+        "temp_c": "double", "dewpoint_c": "double", "rel_humidity_pct": "double", "wind_dir_deg": "double",
+        "wind_speed_kt": "double", "wind_gust_kt": "double", "visibility_m": "double", "ceiling_ft": "double",
+        "present_weather": "string", "has_thunderstorm": "boolean", "has_precipitation": "boolean",
+        "has_fog": "boolean", "is_imc": "boolean", "is_below_cat1": "boolean", "is_strong_wind": "boolean",
+        "raw_metar": "string", "_silver_processed_at_utc": "timestamp", "_source_file": "string",
+        "_ingestion_run_id": "string", "_source_sha256": "string"},
 }
 
 GOLD = {

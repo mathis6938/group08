@@ -2,6 +2,8 @@
 
 Grain: one row per flight (silver/flights), with its events (silver/flight_events) and two reference dimensions
 (silver/airports, silver/runways). Rejected rows go to quarantine/ with the first rule they fail.
+Then the arrival study (arrivals.py: silver/arrivals, silver/descent_level_offs) and the weather observations
+(weather.py: silver/weather_observations, one row per METAR).
 """
 from pyspark.sql import Window
 from pyspark.sql.functions import (
@@ -350,18 +352,24 @@ def run(spark, settings):
         arr_stats = arrivals.run(spark, settings)            # reads the Silver tables written above
         steps.durations.update({f"arrivals: {k}": v for k, v in arr_stats.pop("durations_s", {}).items()})
 
+    with steps.step("weather observations"):
+        from . import weather
+        weather_stats = weather.build_silver(spark, settings)     # silver/ + quarantine/weather_observations
+
     log.info("Silver: %.2f GB | quarantine: %.3f GB | free space left: %.1f GB",
              parquet_gb(s), parquet_gb(q), free_gb(settings.data_root))
 
     with steps.step("before/after evidence"):
         ev = evidence(spark, settings, bronze_flights, bronze_events, std_flights, std_events, quar_schemas)
+    ev["row_accounting"]["weather_observations"] = weather_stats["accounting"]
+    ev["accounting_consistent"] = ev["accounting_consistent"] and weather_stats["accounting_consistent"]
     schema_problems = {t: schemas.compare(spark.read.parquet(str(s / t)).schema, schemas.SILVER[t])
                        for t in schemas.SILVER}
     for t, problems in schema_problems.items():
         for p in problems:
             log.error("  schema of silver/%s: %s", t, p)
     report = write_report(settings, "silver", dict(
-        flight_outcomes=outcomes, **ev, arrivals=arr_stats, schema_problems=schema_problems,
+        flight_outcomes=outcomes, **ev, arrivals=arr_stats, weather=weather_stats, schema_problems=schema_problems,
         size_gb=round(parquet_gb(s), 3), quarantine_size_gb=round(parquet_gb(q), 3),
         durations_s=steps.durations))
     if not ev["accounting_consistent"]:
