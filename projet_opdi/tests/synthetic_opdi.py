@@ -51,6 +51,69 @@ def ts(t):
     return t.strftime("%Y-%m-%d %H:%M:%S")
 
 
+METAR_HEADER = ["station", "valid", "tmpc", "dwpc", "relh", "drct", "sknt", "gust", "vsby", "skyc1", "skyc2", "skyc3",
+                "skyc4", "skyl1", "skyl2", "skyl3", "skyl4", "wxcodes", "metar"]
+WEATHER_STATIONS = ["LFBO", "LFPG", "EGLL"]          # + "ZZZZ": unknown to the archive (header only)
+
+
+def metar_condition(station, t):
+    """Planted weather of a station at time t: (category of the hour, METAR fields that differ from a fine day)."""
+    d, h = t.day, t.hour
+    if station == "LFBO" and d == 12 and h in (8, 9):            # fog, vertical visibility 100 ft: below CAT I
+        return "LOW_VISIBILITY", dict(vsby="0.31", skyc1="VV", skyl1="100.00", wxcodes="FG")
+    if station == "EGLL" and d == 10 and h in (15, 16):          # thunderstorm with gusts
+        return "THUNDERSTORM", dict(sknt="18.00", gust="35.00", wxcodes="+TSRA", skyc1="BKN", skyl1="2500.00")
+    if station == "EGLL" and d == 14:                            # strong wind all day
+        return "STRONG_WIND", dict(sknt="25.00")
+    if station == "EGLL" and d == 15:                            # north wind 350 / 10 deg: vector mean 0 deg
+        return "GOOD", dict(drct="350.00" if t.minute == 0 else "10.00")
+    if station == "LFPG" and d == 11 and h in (10, 11):          # light rain, good visibility
+        return "PRECIPITATION", dict(wxcodes="-RA", skyc1="BKN", skyl1="3000.00")
+    if station == "LFPG" and d == 13 and h in (6, 7):            # low ceiling, no precipitation
+        return "IMC", dict(skyc1="FEW", skyl1="500.00", skyc2="BKN", skyl2="1200.00")
+    if station == "LFPG" and d == 16:                            # showers in the vicinity only: not at the airport
+        return "GOOD", dict(wxcodes="VCSH")
+    if station == "LFPG" and d == 17:                            # mist (not fog), thunderstorm only in the TEMPO trend
+        return "GOOD", dict(vsby="4.00", wxcodes="BR", metar="LFPG 171200Z 24008KT 6000 BR TEMPO TSRA")
+    return "GOOD", {}
+
+
+def write_metar(site: Path):
+    """METAR archive of the synthetic stations (one CSV per station, every 30 min) with planted defects."""
+    expected = dict(stations=list(WEATHER_STATIONS), categories={}, bronze=0, out_of_scope=0, duplicates=0,
+                    quarantine={"UNPARSABLE_TIMESTAMP": 1, "INVALID_WIND": 1, "INVALID_TEMPERATURE": 1})
+    (site / "iem").mkdir(parents=True, exist_ok=True)
+    for station in WEATHER_STATIONS:
+        rows, t = [], datetime.datetime.combine(START, datetime.time())
+        while t.date() < END:
+            category, fields = metar_condition(station, t)
+            row = dict(station=station, valid=t.strftime("%Y-%m-%d %H:%M"), tmpc="18.00", dwpc="10.00",
+                       relh="60.00", drct="240.00", sknt="8.00", gust="M", vsby="6.21", skyc1="FEW", skyc2="M",
+                       skyc3="M", skyc4="M", skyl1="3500.00", skyl2="M", skyl3="M", skyl4="M", wxcodes="M",
+                       metar=f"{station} {t:%d%H%M}Z AUTO")
+            row.update(fields)
+            rows.append(row)
+            expected["categories"].setdefault(station, {}).setdefault(category, set()).add((t.date(), t.hour))
+            t += datetime.timedelta(minutes=30)
+        if station == "LFBO":                                     # defects: quarantine, duplicate, out of scope
+            rows.append(dict(rows[0], valid="not a date"))
+            rows.append(dict(rows[1], valid="2026-06-09 00:10", sknt="-5.00"))
+            rows.append(dict(rows[2], valid="2026-06-09 00:20", tmpc="75.00"))
+            rows.append(dict(rows[3]))
+            rows.append(dict(rows[4], valid="2026-06-19 00:00"))
+            expected["duplicates"], expected["out_of_scope"] = 1, 1
+        expected["bronze"] += len(rows)
+        with open(site / "iem" / f"{station}.csv", "w", newline="") as f:
+            out = csv.DictWriter(f, fieldnames=METAR_HEADER)
+            out.writeheader()
+            out.writerows(rows)
+    (site / "iem" / "ZZZZ.csv").write_text(",".join(METAR_HEADER) + "\n")     # unknown station: header only
+    expected["silver"] = (expected["bronze"] - expected["out_of_scope"] - expected["duplicates"]
+                          - sum(expected["quarantine"].values()))
+    expected["categories"] = {st: {c: len(h) for c, h in cats.items()} for st, cats in expected["categories"].items()}
+    return expected
+
+
 def write_site(site: Path, n_flights: int = 300, seed: int = 535):
     """Write the synthetic files under `site` (served as the EUROCONTROL / OurAirports URLs)."""
     rnd = random.Random(seed)
@@ -220,6 +283,8 @@ def write_site(site: Path, n_flights: int = 300, seed: int = 535):
                                       ("measurements", measurements, MS_SCHEMA, f"measurements_{w}.parquet")]:
         (site / "opdi" / table).mkdir(parents=True, exist_ok=True)
         pq.write_table(pa.Table.from_pylist(rows, schema=schema), site / "opdi" / table / name)
+
+    expected["weather"] = write_metar(site)
 
     (site / "ourairports").mkdir(parents=True, exist_ok=True)
     with open(site / "ourairports" / "airports.csv", "w", newline="") as f:

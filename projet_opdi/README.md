@@ -25,6 +25,7 @@ projet_opdi/
 │   ├── silver.py                #   nettoyage, quarantaine, doublons, enrichissement -> silver/, quarantine/
 │   │                            #   (API DataFrame)
 │   ├── arrivals.py              #   efficacité arrivées (anneau 100 NM, profils de descente, attentes)
+│   ├── weather.py               #   météo METAR : Silver (observations, conditions) et comparaison ML
 │   ├── gold.py + sql/*.sql      #   activité des aéroports en Spark SQL, validation, publication -> gold/
 │   ├── ml.py                    #   modèle GBT temps additionnel, scénarios, typologie KMeans -> gold/, models/
 │   ├── schemas.py               #   contrats de schéma : sources (raw), tables Silver et Gold publiées
@@ -36,7 +37,11 @@ projet_opdi/
 │   ├── 02_pipeline_walkthrough.ipynb # le pipeline couche par couche, avec les preuves de chaque couche
 │   ├── 03_performance.ipynb          # goulots d'étranglement et optimisations mesurées
 │   ├── 04_gold_dashboard.ipynb       # tableau de bord : le consommateur du Gold (graphiques LFBO, ENZV...)
-│   └── 05_arrival_efficiency.ipynb   # étude de l'efficacité des arrivées et machine learning (8 visualisations)
+│   ├── 05_arrival_efficiency.ipynb   # étude de l'efficacité des arrivées et machine learning (7 figures)
+│   └── 06_weather.ipynb              # météo et efficacité des arrivées (figures 08 à 11)
+├── docs/
+│   ├── report.pdf, report.tex   # rapport final (run prod-8)
+│   └── figures/                 # figures de l'étude, exportées par les notebooks 05 et 06
 ├── tests/                       # pytest (voir « Tests »)
 ├── requirements-test.txt, pytest.ini
 └── scripts/                     # scripts d'exploration du début du projet
@@ -99,11 +104,12 @@ python projet_opdi/run_pipeline.py --help
   l'étude de l'efficacité des arrivées (types et unités de `measurements`, jalons de descente et leur couverture
   par aéroport, appariement des paliers après le début de descente, signature des circuits d'attente) et écrit
   `reports/<run id>/explore.json`. Dans GitHub Actions : *Run workflow* sur le workflow dev, case `explore`.
-- Notebooks vitrine : *Run workflow* sur le workflow dev, case `notebooks`, exécute les notebooks 02, 04 et 05 sur les
+- Notebooks vitrine : *Run workflow* sur le workflow dev, case `notebooks`, exécute les notebooks 02, 04, 05 et 06 sur les
   tables **prod** (lecture seule) et publie en artefact les notebooks exécutés et les figures de `docs/figures/` :
   pas besoin d'accéder au Jupyter de la VM, qui n'est joignable que depuis le réseau de l'université.
 - Paramètres : `config/<env>.toml`. Les variables d'environnement `OPDI_START`, `OPDI_END`, `OPDI_DATA_ROOT`,
-  `OPDI_RUN_ID`, `OPDI_FULL_REFRESH` (et `OPDI_BASE_URL`, `OPDI_AIRPORTS_URL`, `OPDI_RUNWAYS_URL` pour les tests) les remplacent, et
+  `OPDI_RUN_ID`, `OPDI_FULL_REFRESH` (et `OPDI_BASE_URL`, `OPDI_AIRPORTS_URL`, `OPDI_RUNWAYS_URL`,
+  `OPDI_WEATHER_URL`, `OPDI_WEATHER_STATIONS`, `OPDI_WEATHER_PAUSE_S` pour les tests) les remplacent, et
   les arguments de la ligne de commande remplacent les variables.
 - Notebooks : ouvrir `notebooks/` dans Jupyter sur la VM. Ils lisent par défaut les rapports du dernier run
   (`RUN_PIPELINE = False`), ou relancent le pipeline (`True`).
@@ -125,8 +131,9 @@ python -m pytest -v -m "not slow"        # sans les tests de bout en bout
 | `test_silver_rules.py` | nettoyage (valeurs manquantes, codes OACI, périmètre) et chaque règle de quarantaine |
 | `test_arrival_rules.py` | géométrie d'arrivée (gisement, 8 secteurs, haversine, interpolation d'entrée 100 NM, détection d'attentes) |
 | `test_ml.py` | découpage temporel sans fuite, entraînement GBTRegressor, baseline naïve, clustering KMeans et contrats de schéma ML |
-| `test_notebooks.py` | le code des 5 notebooks vitrine reste valide |
-| `test_pipeline_smoke.py` | **tout le pipeline, couche par couche via la ligne de commande**, sur des données synthétiques servies par un faux serveur EUROCONTROL. On y a placé des défauts connus : doublons, dates illisibles, chronologie inversée, aéroports vides ou `"nan"`, événements orphelins, pistes traversées. Le test vérifie les chiffres exacts de chaque couche, les contrats de schéma des tables publiées, qu'un second run donne les mêmes tables sans rien reconstruire, qu'un fichier republié ne reconstruit que sa période, et qu'un contrôle qualité en échec arrête le run |
+| `test_weather.py` | lecture des METAR (unités, plafond = couche BKN / OVC / VV la plus basse, codes de temps présent : VCSH, BR, TEMPO), seuils IMC / CAT I / vent fort, règles de quarantaine, agrégation horaire Gold (catégorie, direction moyenne vectorielle) |
+| `test_notebooks.py` | le code des 6 notebooks vitrine reste valide |
+| `test_pipeline_smoke.py` | **tout le pipeline, couche par couche via la ligne de commande**, sur des données synthétiques servies par un faux serveur EUROCONTROL (et une fausse archive METAR). On y a placé des défauts connus : doublons, dates illisibles, chronologie inversée, aéroports vides ou `"nan"`, événements orphelins, pistes traversées, METAR invalides, en double ou hors période, station inconnue de l'archive. Le test vérifie les chiffres exacts de chaque couche, les contrats de schéma des tables publiées, qu'un second run donne les mêmes tables sans rien reconstruire, qu'un fichier republié ne reconstruit que sa période, qu'un contrôle qualité en échec arrête le run, les conditions météo plantées heure par heure, et qu'un METAR au mauvais format est écarté sans bloquer le pipeline |
 
 ## CI/CD (GitHub Actions)
 
@@ -209,13 +216,46 @@ Pour répondre à cette question sans biaiser les résultats avec des heures de 
   mis en cache sur disque. Des mesures, seule la distance parcourue est jointe (pas d'agrégation des 119 M lignes).
 - `silver/descent_level_offs` est écrite d'abord, puis relue pour construire `silver/arrivals`.
 
+### Météo (METAR) — ajoutée après l'oral
+Les METAR sont les bulletins météo que chaque aéroport publie toutes les 30 ou 60 minutes (visibilité, nuages, vent,
+temps présent). Ils viennent de l'archive publique de l'Iowa Environmental Mesonet (IEM, sans clé), **pour la période
+réelle du périmètre**, pour 34 aéroports (`config/*.toml`, section `[weather]`) : les 30 aéroports avec le plus
+d'arrivées mesurées en prod-8 et les aéroports étudiés absents de cette liste (LFPG, EGLL, LFBO, ENZV). La météo
+passe par les mêmes couches que les données OPDI, sans rien changer aux tables existantes :
+- **Ingestion** : `raw/weather/metar_<ICAO>_<début>_<fin>.csv`, une ligne par fichier dans le manifeste (SHA-256).
+  L'archive est un service de requêtes (ni taille ni `Last-Modified`) : un fichier est téléchargé une fois ; une
+  station sans observation donne le résultat `empty` (fichier non gardé).
+- **Bronze** : `bronze/metar` (colonnes du CSV en texte + traçabilité, une partition par station), contrat de schéma
+  sur l'en-tête (`schemas.RAW["metar"]`), construction incrémentale et réconciliation, comme les fichiers OPDI.
+- **Silver** (`weather.py`) : `silver/weather_observations`, une ligne par METAR, typée (visibilité en mètres,
+  plafond = couche BKN / OVC / VV la plus basse), règles qualité avec quarantaine (`UNPARSABLE_TIMESTAMP`,
+  `INVALID_WIND`, `INVALID_VISIBILITY`, `INVALID_TEMPERATURE`, `MISSING_STATION`), dédoublonnage, comptage des
+  lignes vérifié par le contrôle « Silver row accounting ». Conditions de chaque observation :
+  IMC (visibilité < 5 km ou plafond < 1 500 ft, minima VFR OACI), sous les minima CAT I (< 800 m ou < 200 ft),
+  vent fort (≥ 20 kt ou rafales ≥ 30 kt, notre seuil), orage / précipitations / brouillard lus dans les codes de
+  temps présent (pas dans la prévision TEMPO ; VCSH « au voisinage » et la brume BR ne comptent pas).
+- **Gold** (Spark SQL) : `airport_weather_hourly` (météo de chaque heure d'aéroport : pire visibilité et plafond,
+  vent moyen et direction moyenne vectorielle, rafale max, une **catégorie** par heure : THUNDERSTORM >
+  LOW_VISIBILITY > IMC > STRONG_WIND > PRECIPITATION > GOOD) et `arrival_weather_impact` (temps additionnel,
+  paliers, attentes par aéroport et catégorie, heures complètes), avec leurs contrôles de validation. Une heure sans
+  METAR n'a pas de ligne : rien n'est inventé.
+- **ML** : le même GBT (mêmes variables, hyperparamètres et découpage temporel), entraîné sur les mêmes arrivées sans
+  puis avec la météo de l'heure d'arrivée, chacun comparé à la référence naïve sur les mêmes jours de test
+  (`gold/ml_weather_comparison`) ; l'importance des variables météo (`gold/ml_weather_feature_importance`) n'est
+  publiée que si le modèle avec météo bat la référence naïve.
+- **Notebook** `06_weather` (figures 08 à 11) ; partie « Weather » du résumé de run.
+
+Limites : météo de l'heure d'arrivée à destination seulement (ni en route, ni vents en altitude) ; période d'été ;
+association, pas causalité (une heure d'orage peut aussi être une heure chargée : le notebook 06 compare les deux).
+
 ### Limites méthodologiques
 1. **Couverture des pistes :** L'assignation des pistes d'atterrissage dans les données ouvertes dépend des géométries OpenStreetMap et des événements au sol disponibles. La hiérarchie de repli garantit qu'aucun vol n'est privé de référence même si la piste est manquante.
 2. **Absence d'horaires programmés :** OPDI ne fournissant pas les horaires prévus de grille (créneaux IATA / OAG), le temps de transit réel et la référence unimpeded au 20ème percentile constituent la référence relative objective.
-3. **Données météorologiques externes :** Les conditions de vent, visibilité ou orages ne sont pas directement synchronisées dans la source OPDI brute.
+3. **Météo :** seulement celle de l'heure d'arrivée à l'aéroport de destination (METAR), pour 34 aéroports.
 
 ## Sources
 
 - OPDI : <https://www.opdi.aero> (données, méthodologie). Téléchargement :
   `https://www.eurocontrol.int/performance/data/download/OPDI/v002/...`
 - OurAirports : <https://davidmegginson.github.io/ourairports-data/>
+- METAR : archive ASOS / METAR de l'Iowa Environmental Mesonet, <https://mesonet.agron.iastate.edu/request/download.phtml>

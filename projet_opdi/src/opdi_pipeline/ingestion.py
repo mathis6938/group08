@@ -3,7 +3,12 @@ and record every file in raw/manifest.csv (URL, size, Last-Modified, SHA-256, ru
 
 A file already in raw/ is downloaded again only if the source published a new version of it (different size or
 Last-Modified than the copy we have): EUROCONTROL republishes corrected files, and OurAirports is updated daily.
+
+Weather: one CSV of METAR observations per airport for the real period of the scope (raw/weather/), from the public
+archive of the Iowa Environmental Mesonet. It is a query service (no file size, no Last-Modified): a file is downloaded
+once; an archive of past observations does not change.
 """
+import urllib.parse
 import csv
 import datetime
 import hashlib
@@ -18,6 +23,12 @@ from .common import Steps, free_gb, log, utc_now, write_report
 from .config import PARQUET_TABLES
 
 OK_RESULTS = ("downloaded", "already_present", "republished")
+WEATHER_TABLE = "weather"
+WEATHER_MAX_FAILURES = 3        # METAR downloads failed in a row: archive unreachable, other stations skipped
+WEATHER_TIMEOUT_S = 60
+# METAR fields requested from the archive (the CSV header has exactly these columns: see schemas.RAW["metar"])
+METAR_FIELDS = ("tmpc", "dwpc", "relh", "drct", "sknt", "gust", "vsby", "skyc1", "skyc2", "skyc3", "skyc4",
+                "skyl1", "skyl2", "skyl3", "skyl4", "wxcodes", "metar")
 
 
 def months(start, end):
@@ -36,6 +47,27 @@ def windows(start, end, origin, days=10):
         w += datetime.timedelta(days=days)
 
 
+def weather_file_name(station, start, end):
+    return f"metar_{station}_{start:%Y%m%d}_{end:%Y%m%d}.csv"
+
+
+def weather_url(settings, station):
+    """Archive query: every METAR of one airport over the real period of the scope [start, end[, times in UTC."""
+    s, e = settings.start, settings.end
+    params = [("station", station), *[("data", f) for f in METAR_FIELDS],
+              ("year1", s.year), ("month1", s.month), ("day1", s.day),
+              ("year2", e.year), ("month2", e.month), ("day2", e.day),
+              ("tz", "Etc/UTC"), ("format", "onlycomma"), ("latlon", "no"), ("missing", "M"), ("direct", "no")]
+    return f"{settings.weather.base_url}?{urllib.parse.urlencode(params)}"
+
+
+def data_rows(path):
+    """Number of observations in a downloaded METAR CSV (header and '#' comment lines excluded)."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = [line for line in f if line.strip() and not line.startswith("#")]
+    return max(len(lines) - 1, 0)
+
+
 def source_files(settings):
     """Files of the scope, as (table, file name, URL)."""
     files = []
@@ -46,6 +78,9 @@ def source_files(settings):
         for w, w_end in windows(settings.start, settings.end, settings.origin):
             n = f"{table}_{w:%Y%m%d}_{w_end:%Y%m%d}.parquet"
             files.append((table, n, f"{settings.base_url}/{table}/{n}"))
+    for station in settings.weather.stations:
+        files.append((WEATHER_TABLE, weather_file_name(station, settings.start, settings.end),
+                      weather_url(settings, station)))
     for n, url in settings.ref_urls.items():
         files.append(("reference", n, url))
     return files
@@ -73,13 +108,13 @@ def head(url, user_agent="UiS-DAT535-group08"):
         return type(e).__name__, 0, ""
 
 
-def download(url, dest, retries=3, user_agent="UiS-DAT535-group08", wait_s=5):
+def download(url, dest, retries=3, user_agent="UiS-DAT535-group08", wait_s=5, timeout=300):
     """Download to a temporary .part file, then rename: an interrupted download never leaves a partial file."""
     tmp = dest.with_name(dest.name + ".part")
     for attempt in range(1, retries + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-            with urllib.request.urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
+            with urllib.request.urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
                 shutil.copyfileobj(r, f, 1 << 20)                  # 1 MB chunks
             os.replace(tmp, dest)
             return "downloaded"
@@ -127,26 +162,49 @@ def run(settings):
              settings.start, settings.end, len(files), settings.raw_dir, free_gb(settings.raw_dir))
     rows = []
     previous = last_manifest_entries(settings)
+    weather_failures = 0                                           # METAR downloads failed in a row
     with steps.step("download"):
         for i, (table, name, url) in enumerate(files, 1):
-            status, size, last_modified = head(url, settings.user_agent)
             dest = settings.raw_dir / table / name
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if status != 200:
-                result = "absent"
-            elif size == 0:
-                result = "empty"
-            elif dest.exists() and not is_republished(dest, size, last_modified, previous.get(name)):
-                result = "already_present"
-            elif free_gb(settings.raw_dir) - size / 1e9 < settings.min_free_gb:
-                log.error("STOP: insufficient free space before %s", name)
-                break
+            if table == WEATHER_TABLE:                               # query service: no HEAD, downloaded once
+                status, size, last_modified = "", 0, ""
+                if dest.exists():
+                    result = "already_present"
+                elif weather_failures >= WEATHER_MAX_FAILURES:       # the weather never blocks the OPDI pipeline
+                    result = "skipped"
+                elif free_gb(settings.raw_dir) < settings.min_free_gb:
+                    log.error("STOP: insufficient free space before %s", name)
+                    break
+                else:
+                    result = download(url, dest, settings.retries, settings.user_agent, timeout=WEATHER_TIMEOUT_S)
+                    weather_failures = weather_failures + 1 if result == "failed" else 0
+                    if weather_failures == WEATHER_MAX_FAILURES:
+                        log.error("METAR archive unreachable (%d downloads failed in a row): other stations skipped",
+                                  weather_failures)
+                    if result == "downloaded" and data_rows(dest) == 0:     # unknown station or no report
+                        dest.unlink()
+                        result = "empty"
+                    time.sleep(settings.weather.pause_s)
+                if dest.exists():
+                    status, size = 200, dest.stat().st_size
             else:
-                republished = dest.exists()          # new version: the .part download replaces the old copy
-                result = download(url, dest, settings.retries, settings.user_agent)
-                if republished and result == "downloaded":
-                    result = "republished"
-                    log.warning("    %s was republished by the source: new version downloaded", name)
+                status, size, last_modified = head(url, settings.user_agent)
+                if status != 200:
+                    result = "absent"
+                elif size == 0:
+                    result = "empty"
+                elif dest.exists() and not is_republished(dest, size, last_modified, previous.get(name)):
+                    result = "already_present"
+                elif free_gb(settings.raw_dir) - size / 1e9 < settings.min_free_gb:
+                    log.error("STOP: insufficient free space before %s", name)
+                    break
+                else:
+                    republished = dest.exists()          # new version: the .part download replaces the old copy
+                    result = download(url, dest, settings.retries, settings.user_agent)
+                    if republished and result == "downloaded":
+                        result = "republished"
+                        log.warning("    %s was republished by the source: new version downloaded", name)
             ok = result in OK_RESULTS
             rows.append(dict(run_id=settings.run_id, table=table, file=name, url=url, http_status=status,
                              size_bytes=size, last_modified=last_modified, result=result,
@@ -165,7 +223,7 @@ def run(settings):
 
     results = Counter(r["result"] for r in rows)
     sizes = {t: round(sum(int(r["size_bytes"]) for r in rows if r["table"] == t and r["local_path"]) / 1e9, 3)
-             for t in (*PARQUET_TABLES, "reference")}
+             for t in (*PARQUET_TABLES, WEATHER_TABLE, "reference")}
     problems = [dict(file=r["file"], result=r["result"], http_status=r["http_status"])
                 for r in rows if r["result"] not in OK_RESULTS]
     log.info("Results: %s | sizes (GB): %s | free space left %.1f GB",

@@ -3,6 +3,7 @@
 - RAW: schema of the OPDI v0.0.2 files of 2026. Bronze compares every raw file with it, so a schema change at the
   source (e.g. the `decimal` ids and `timestamp_ntz` dates of 2025) stops the run before Silver, instead of
   producing wrong data. A new variant then needs a mapping in silver.standardize_* and a new contract.
+- RAW["metar"]: header of the METAR CSV files of the weather archive (every column read as text).
 - SILVER, GOLD: schema of the published tables. Silver and Gold check their written tables against them, and the
   tests check them too, so that a code change cannot silently change what downstream consumers read.
 """
@@ -18,6 +19,9 @@ RAW = {
         "latitude": "double", "altitude": "double", "source": "string", "version": "string", "info": "string"},
     "measurements": {
         "id": "bigint", "event_id": "bigint", "type": "string", "value": "double", "version": "string"},
+    "metar": {c: "string" for c in ("station", "valid", "tmpc", "dwpc", "relh", "drct", "sknt", "gust", "vsby",
+                                    "skyc1", "skyc2", "skyc3", "skyc4", "skyl1", "skyl2", "skyl3", "skyl4",
+                                    "wxcodes", "metar")},
 }
 
 SILVER = {
@@ -64,6 +68,14 @@ SILVER = {
         "start_lat": "double", "start_lon": "double", "end_lat": "double", "end_lon": "double",
         "distance_flown_km": "double", "displacement_km": "double", "is_holding": "boolean",
         "segments_merged": "bigint", "_silver_processed_at_utc": "timestamp"},
+    "weather_observations": {
+        "station_icao": "string", "obs_time_utc": "timestamp", "obs_date": "date", "obs_hour": "int",
+        "temp_c": "double", "dewpoint_c": "double", "rel_humidity_pct": "double", "wind_dir_deg": "double",
+        "wind_speed_kt": "double", "wind_gust_kt": "double", "visibility_m": "double", "ceiling_ft": "double",
+        "present_weather": "string", "has_thunderstorm": "boolean", "has_precipitation": "boolean",
+        "has_fog": "boolean", "is_imc": "boolean", "is_below_cat1": "boolean", "is_strong_wind": "boolean",
+        "raw_metar": "string", "_silver_processed_at_utc": "timestamp", "_source_file": "string",
+        "_ingestion_run_id": "string", "_source_sha256": "string"},
 }
 
 GOLD = {
@@ -124,6 +136,23 @@ GOLD = {
         "avg_additional_min": "double", "p90_additional_min": "double",
         "avg_level_minutes": "double", "pct_with_holding": "double",
         "day_to_day_std": "double", "_ml_built_at_utc": "timestamp"},
+    "airport_weather_hourly": {
+        "airport_icao": "string", "weather_date": "date", "weather_hour": "int", "observations": "bigint",
+        "avg_temp_c": "double", "avg_wind_speed_kt": "double", "wind_dir_deg": "double", "max_gust_kt": "double",
+        "min_visibility_m": "double", "min_ceiling_ft": "double", "has_thunderstorm": "boolean",
+        "has_precipitation": "boolean", "has_fog": "boolean", "is_imc": "boolean", "is_below_cat1": "boolean",
+        "is_strong_wind": "boolean", "weather_category": "string", "_gold_built_at_utc": "timestamp"},
+    "arrival_weather_impact": {
+        "airport_icao": "string", "weather_category": "string", "hours": "bigint", "arrivals": "bigint",
+        "arrivals_measured": "bigint", "avg_additional_min": "double", "median_additional_min": "double",
+        "avg_level_minutes": "double", "pct_with_holding": "double", "holding_minutes": "double",
+        "airport_name": "string", "iso_country": "string", "_gold_built_at_utc": "timestamp"},
+    "ml_weather_comparison": {
+        "model": "string", "n_features": "int", "airports": "bigint", "train_rows": "bigint", "test_rows": "bigint",
+        "split_date": "date", "mae": "double", "rmse": "double", "r2": "double",
+        "beats_naive_baseline": "boolean", "_ml_built_at_utc": "timestamp"},
+    "ml_weather_feature_importance": {
+        "variable": "string", "importance": "double", "rank": "int", "_ml_built_at_utc": "timestamp"},
 }
 
 

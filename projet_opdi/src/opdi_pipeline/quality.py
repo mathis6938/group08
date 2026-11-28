@@ -6,12 +6,15 @@ import os
 from .common import free_gb, log, parquet_gb, read_report, table_rows, utc_now, write_report
 
 LAYER_TABLES = [
-    ("Bronze", "bronze_dir", ["flight_list", "flight_events", "measurements", "airports", "runways"]),
-    ("Silver", "silver_dir", ["flights", "flight_events", "airports", "runways", "arrivals", "descent_level_offs"]),
-    ("Quarantine", "quarantine_dir", ["flights", "flight_events"]),
+    ("Bronze", "bronze_dir", ["flight_list", "flight_events", "measurements", "airports", "runways", "metar"]),
+    ("Silver", "silver_dir", ["flights", "flight_events", "airports", "runways", "arrivals", "descent_level_offs",
+                              "weather_observations"]),
+    ("Quarantine", "quarantine_dir", ["flights", "flight_events", "weather_observations"]),
     ("Gold", "gold_dir", ["airport_hourly_ops", "airport_daily_ops", "runway_usage", "airport_ground_times",
                           "arrival_reference", "airport_arrival_daily", "airport_arrival_hourly", "holding_hotspots",
-                          "ml_feature_importance", "ml_scenarios", "airport_typology"]),
+                          "ml_feature_importance", "ml_scenarios", "airport_typology",
+                          "airport_weather_hourly", "arrival_weather_impact", "ml_weather_comparison",
+                          "ml_weather_feature_importance"]),
 ]
 
 
@@ -27,6 +30,31 @@ def gates(settings):
         "Gold: validation checks": bool(gold and gold["validation_passed"]),
         "Gold: published (_SUCCESS marker)": (settings.gold_dir / "_SUCCESS").exists(),
     }
+
+
+def weather_summary(settings, reports):
+    """Weather part of the run: stations ingested, observations in Silver, ML comparison; warnings (non-blocking: the
+    weather tables are checked by the Bronze, Silver and Gold gates whenever they exist)."""
+    ingest, bronze, silver, gold, ml = (reports.get(k) or {} for k in ("ingest", "bronze", "silver", "gold", "ml"))
+    sw = silver.get("weather") or {}
+    warnings = []
+    failed = [p["file"] for p in ingest.get("problems", [])          # "empty": no report, see stations_without_data
+              if p["file"].startswith("metar_") and p["result"] != "empty"]
+    if failed:
+        warnings.append(f"METAR files not downloaded: {failed}")
+    if bronze.get("weather_files_off_contract"):
+        warnings.append(f"METAR files off the schema contract, not loaded: {bronze['weather_files_off_contract']}")
+    if settings.weather.stations and silver and not sw.get("available"):
+        warnings.append("no weather observation in Silver: weather tables not built")
+    if sw.get("stations_without_data"):
+        warnings.append(f"no observation for {sw['stations_without_data']}")
+    mw = ml.get("weather") or {}
+    return dict(stations_configured=len(settings.weather.stations),
+                stations_with_data=len(sw.get("observations_by_station", {})),
+                observations=(sw.get("accounting") or {}).get("silver"),
+                ml_comparison={k: mw.get(k) for k in ("status", "delta_mae_min", "delta_r2",
+                                                      "weather_importance_share")} if mw else None,
+                gold=(gold.get("weather") or {}).get("by_category"), warnings=warnings)
 
 
 def run(spark, settings):
@@ -58,6 +86,10 @@ def run(spark, settings):
         ml_warning = f"GBT model did not beat baseline (MAE: {ml.get('model_mae', 0):.2f} vs {ml.get('baseline_mae', 0):.2f})"
         log.warning("WARNING: %s; ML tables not published", ml_warning)
 
+    weather = weather_summary(settings, reports)
+    for w in weather["warnings"]:
+        log.warning("WARNING (weather): %s", w)
+
     gate_results = gates(settings)
     for name, ok in gate_results.items():
         log.info("  %s  %s", "PASSED" if ok else "FAILED", name)
@@ -69,7 +101,7 @@ def run(spark, settings):
                    generated_at_utc=utc_now().isoformat(timespec="seconds"), scope_start=str(settings.start),
                    scope_end=str(settings.end), data_root=str(settings.data_root), gates=gate_results,
                    tables=tables, quarantine_reasons=silver.get("quarantine_reasons", {}),
-                   incomplete_hours=incomplete_hours, ml_warning=ml_warning,
+                   incomplete_hours=incomplete_hours, ml_warning=ml_warning, weather=weather,
                    step_durations_s=durations, free_disk_gb=round(free_gb(settings.data_root), 1))
     (settings.data_root / "pipeline_summary.json").write_text(json.dumps(summary, indent=2))
     write_report(settings, "summary", summary)
@@ -99,6 +131,16 @@ def write_github_summary(s):
     if s.get("ml_warning"):
         lines += ["", "### Machine learning warning", "",
                   f"⚠️ **{s['ml_warning']}** (tables and model not published)"]
+    w = s.get("weather") or {}
+    if w.get("stations_configured"):
+        lines += ["", "### Weather (METAR)", "",
+                  f"{w['stations_with_data']} / {w['stations_configured']} airports with observations, "
+                  f"{w['observations'] or 0:,} observations in Silver"]
+        if w.get("ml_comparison"):
+            m = w["ml_comparison"]
+            lines += ["", f"GBT with vs without weather: {m['status']} | MAE gain {m['delta_mae_min']} min | "
+                          f"R2 gain {m['delta_r2']} | weather share of the importance {m['weather_importance_share']}"]
+        lines += [f"- ⚠️ {x}" for x in w.get("warnings", [])]
     if s.get("quarantine_reasons"):
         lines += ["", "### Quarantine reasons", "", "| Table | Reason | Rows |", "|---|---|---:|"]
         lines += [f"| {table} | {reason} | {n:,} |"

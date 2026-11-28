@@ -18,6 +18,9 @@ ENV_VARS = {
     "OPDI_BASE_URL": "base_url", "OPDI_AIRPORTS_URL": "airports_url", "OPDI_RUNWAYS_URL": "runways_url",
     "OPDI_FULL_REFRESH": "full_refresh",
 }
+# environment variable -> weather setting (tests: fake METAR server and a few stations)
+WEATHER_ENV_VARS = {"OPDI_WEATHER_URL": "base_url", "OPDI_WEATHER_STATIONS": "stations",
+                    "OPDI_WEATHER_PAUSE_S": "pause_s"}
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,21 @@ class MLSettings:
 
 
 @dataclass(frozen=True)
+class WeatherSettings:
+    """METAR observations of the destination airports (Iowa Environmental Mesonet archive) and the thresholds of the
+    weather conditions. Visibility and ceiling thresholds come from ICAO definitions (see config/*.toml)."""
+    base_url: str = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+    stations: tuple = ()                    # ICAO codes of the airports whose METAR are ingested
+    pause_s: float = 2.0                    # pause after each download (public archive: be polite)
+    vmc_visibility_m: float = 5000.0        # below 5 km visibility or ...
+    vmc_ceiling_ft: float = 1500.0          # ... a ceiling below 1 500 ft: instrument conditions (IMC)
+    cat1_visibility_m: float = 800.0        # below 800 m visibility or ...
+    cat1_ceiling_ft: float = 200.0          # ... a ceiling below 200 ft: below ILS CAT I minima (low-visibility ops)
+    strong_wind_kt: float = 20.0            # mean wind >= 20 kt or ...
+    strong_gust_kt: float = 30.0            # ... gusts >= 30 kt: strong wind (our threshold)
+
+
+@dataclass(frozen=True)
 class Settings:
     env: str
     start: datetime.date            # inclusive
@@ -74,6 +92,7 @@ class Settings:
     full_refresh: bool = False      # rebuild every Bronze period, even if its source file did not change
     arrivals: ArrivalsSettings = ArrivalsSettings()
     ml: MLSettings = MLSettings()
+    weather: WeatherSettings = WeatherSettings()
 
     @property
     def raw_dir(self):
@@ -124,6 +143,36 @@ def _date(value):
     return value if isinstance(value, datetime.date) else datetime.date.fromisoformat(str(value))
 
 
+def _stations(value):
+    """Station list from the TOML (list) or from an environment variable / argument ("EGLL,LFPG" or "")."""
+    if isinstance(value, str):
+        value = value.split(",")
+    return tuple(v.strip().upper() for v in value if v and v.strip())
+
+
+def load_weather(cfg, overrides):
+    """[weather] section, then OPDI_WEATHER_* environment variables, then weather_* keyword arguments."""
+    values = dict(cfg.get("weather", {}))
+    for var, key in WEATHER_ENV_VARS.items():
+        if os.environ.get(var) is not None:
+            values[key] = os.environ[var]
+    for key in ("base_url", "stations", "pause_s"):
+        if overrides.get(f"weather_{key}") is not None:
+            values[key] = overrides[f"weather_{key}"]
+    default = WeatherSettings()
+    return WeatherSettings(
+        base_url=str(values.get("base_url", default.base_url)),
+        stations=_stations(values.get("stations", ())),
+        pause_s=float(values.get("pause_s", default.pause_s)),
+        vmc_visibility_m=float(values.get("vmc_visibility_m", default.vmc_visibility_m)),
+        vmc_ceiling_ft=float(values.get("vmc_ceiling_ft", default.vmc_ceiling_ft)),
+        cat1_visibility_m=float(values.get("cat1_visibility_m", default.cat1_visibility_m)),
+        cat1_ceiling_ft=float(values.get("cat1_ceiling_ft", default.cat1_ceiling_ft)),
+        strong_wind_kt=float(values.get("strong_wind_kt", default.strong_wind_kt)),
+        strong_gust_kt=float(values.get("strong_gust_kt", default.strong_gust_kt)),
+    )
+
+
 def load_settings(env="prod", **overrides):
     """Settings of `env` ("dev" or "prod"); keyword arguments (e.g. start="2026-06-01") override everything."""
     path = CONFIG_DIR / f"{env}.toml"
@@ -135,6 +184,8 @@ def load_settings(env="prod", **overrides):
     for var, key in ENV_VARS.items():
         if os.environ.get(var):
             values[key] = os.environ[var]
+    weather = load_weather(cfg, overrides)
+    overrides = {k: v for k, v in overrides.items() if not k.startswith("weather_")}
     values.update({k: v for k, v in overrides.items() if v not in (None, "")})
     values.setdefault("run_id", datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
 
@@ -177,7 +228,7 @@ def load_settings(env="prod", **overrides):
         pause_s=float(values["pause_s"]), user_agent=values["user_agent"], app_name=values["app_name"],
         driver_memory=str(values["driver_memory"]), shuffle_partitions=int(values["shuffle_partitions"]),
         run_id=str(values["run_id"]), full_refresh=_bool(values.get("full_refresh", False)),
-        arrivals=arrivals, ml=ml)
+        arrivals=arrivals, ml=ml, weather=weather)
     if settings.start >= settings.end:
         raise ValueError(f"empty scope: start {settings.start} must be before end {settings.end}")
     return settings

@@ -5,7 +5,11 @@ passes.
 Airport events carry their airport in the `info` JSON (`osm_airport`, ICAO code) and the airport element in
 `osm_ref` (e.g. runway "07-25"), so each runway / parking event is attached to the departure or to the arrival
 airport of its flight.
+
+Weather (when silver/weather_observations has observations): airport_weather_hourly (weather of each airport hour)
+and arrival_weather_impact (arrival indicators by weather category), validated and published with the other tables.
 """
+import shutil
 from pathlib import Path
 
 from pyspark.sql import Row
@@ -24,7 +28,10 @@ GOLD_TABLES = (
 OUTPUT_FILES = {
     "airport_hourly_ops": 4, "airport_daily_ops": 1, "runway_usage": 2, "airport_ground_times": 1,
     "arrival_reference": 1, "airport_arrival_hourly": 2, "airport_arrival_daily": 1, "holding_hotspots": 1,
+    "airport_weather_hourly": 1, "arrival_weather_impact": 1,
 }
+WEATHER_TABLES = ("airport_weather_hourly", "arrival_weather_impact")
+WEATHER_CATEGORIES = ("THUNDERSTORM", "LOW_VISIBILITY", "IMC", "STRONG_WIND", "PRECIPITATION", "GOOD")
 SHOWCASE_AIRPORTS = ["LFBO", "ENZV"]
 FOCUS_AIRPORTS = ["LFPG", "LFBO", "ENZV", "EGLL", "EDDF"]
 
@@ -45,6 +52,11 @@ def register_silver_views(spark, settings):
     (spark.read.parquet(str(s / "airports"))
         .select("airport_icao", "airport_name", "iso_country", "municipality")
         .createOrReplaceTempView("airports_dim"))
+    weather = s / "weather_observations"
+    weather_obs = spark.read.parquet(str(weather)) if weather.exists() else None
+    if weather_obs is not None:
+        weather_obs.createOrReplaceTempView("silver_weather_observations")
+    return weather_obs is not None and weather_obs.limit(1).count() == 1
 
 
 def build_movements(spark, settings):
@@ -200,6 +212,10 @@ def validate(gold, movements, silver_flights, spark, settings, tolerance=0.01):
     ).count()
     checks["holding_hotspots: valid counts and locations"] = invalid_hotspots == 0
 
+    # 5b) Weather tables (when the weather is available)
+    if "airport_weather_hourly" in gold:
+        checks.update(validate_weather(gold, spark))
+
     # 6) Coverage of the indicators (informative, for the report)
     cov = movements.agg(
         spark_round(avg(col("time_from_event").cast("int")) * 100, 1).alias("pct_movements_timed_by_event"),
@@ -250,6 +266,52 @@ def validate(gold, movements, silver_flights, spark, settings, tolerance=0.01):
     return checks, figures
 
 
+def validate_weather(gold, spark):
+    """Checks of the weather tables: valid values, one row per airport hour, and no arrival lost or counted twice."""
+    w, impact = gold["airport_weather_hourly"], gold["arrival_weather_impact"]
+    checks = {}
+    invalid_w = w.filter(
+        ~col("weather_hour").between(0, 23) | (col("observations") <= 0) | (col("min_visibility_m") < 0)
+        | (col("min_ceiling_ft") < 0) | (col("avg_wind_speed_kt") < 0) | (col("max_gust_kt") < col("avg_wind_speed_kt"))
+        | ~col("weather_category").isin(*WEATHER_CATEGORIES)).count()
+    checks["airport_weather_hourly: hours, counts and values valid"] = invalid_w == 0
+    checks["airport_weather_hourly: one row per airport hour"] = (
+        w.count() == w.select("airport_icao", "weather_date", "weather_hour").distinct().count())
+
+    # every arrival of a complete hour at an airport hour with weather is counted once, in one weather category
+    arr, hours = spark.table("silver_arrivals"), spark.table("hourly_completeness").filter(col("is_complete_hour"))
+    expected = (arr.join(hours, (arr.arrival_date == hours.movement_date) & (arr.arrival_hour == hours.movement_hour))
+                .join(w, (arr.dest_icao == w.airport_icao) & (arr.arrival_date == w.weather_date)
+                      & (arr.arrival_hour == w.weather_hour))
+                .count())
+    checks["arrival_weather_impact: arrivals match silver_arrivals in complete hours with weather"] = (
+        (impact.agg(spark_sum("arrivals")).first()[0] or 0) == expected)
+    invalid_i = impact.filter(
+        (col("arrivals") <= 0) | (col("arrivals_measured") < 0) | (col("arrivals_measured") > col("arrivals"))
+        | (col("hours") <= 0) | ~col("pct_with_holding").between(0, 100) | (col("avg_level_minutes") < 0)
+        | (col("holding_minutes") < 0) | ~col("weather_category").isin(*WEATHER_CATEGORIES)).count()
+    checks["arrival_weather_impact: counts and percentages valid"] = invalid_i == 0
+    return checks
+
+
+def weather_figures(gold):
+    """Weather figures for the report: observed airport hours and arrival indicators by category (all airports)."""
+    w, impact = gold["airport_weather_hourly"], gold["arrival_weather_impact"]
+    by_category = (impact.groupBy("weather_category").agg(
+            spark_sum("hours").alias("airport_hours"), spark_sum("arrivals").alias("arrivals"),
+            spark_sum("arrivals_measured").alias("arrivals_measured"),
+            spark_round(spark_sum(col("avg_additional_min") * col("arrivals_measured"))
+                        / spark_sum("arrivals_measured"), 2).alias("avg_additional_min"),
+            spark_round(spark_sum(col("avg_level_minutes") * col("arrivals")) / spark_sum("arrivals"), 2)
+            .alias("avg_level_minutes"),
+            spark_round(spark_sum(col("pct_with_holding") * col("arrivals")) / spark_sum("arrivals"), 1)
+            .alias("pct_with_holding"))
+        .orderBy("weather_category").collect())
+    return dict(airports=w.select("airport_icao").distinct().count(), airport_hours=w.count(),
+                hours_by_category={r[0]: r[1] for r in w.groupBy("weather_category").count().collect()},
+                by_category=[r.asDict() for r in by_category])
+
+
 def publish(spark, settings, gold):
     """_SUCCESS marker + one record per table in gold/run_status (history of the publications)."""
     marker = settings.gold_dir / "_SUCCESS"
@@ -267,7 +329,7 @@ def run(spark, settings):
     steps = Steps()
     g = settings.gold_dir
     (g / "_SUCCESS").unlink(missing_ok=True)          # Gold is "not ready" until it is published again
-    register_silver_views(spark, settings)
+    weather_available = register_silver_views(spark, settings)
     silver_fl = spark.table("silver_flights")
 
     flights_timed, movements = build_movements(spark, settings)
@@ -300,7 +362,21 @@ def run(spark, settings):
     with steps.step("write gold/holding_hotspots"):
         write_table(spark.sql(sql_text("holding_hotspots")), g / "holding_hotspots", files=OUTPUT_FILES["holding_hotspots"])
 
-    gold = {name: spark.read.parquet(str(g / name)) for name in GOLD_TABLES}
+    if weather_available:
+        with steps.step("write gold/airport_weather_hourly"):
+            write_table(spark.sql(sql_text("airport_weather_hourly")), g / "airport_weather_hourly",
+                        files=OUTPUT_FILES["airport_weather_hourly"])
+        spark.read.parquet(str(g / "airport_weather_hourly")).createOrReplaceTempView("gold_airport_weather_hourly")
+        with steps.step("write gold/arrival_weather_impact"):
+            write_table(spark.sql(sql_text("arrival_weather_impact")), g / "arrival_weather_impact",
+                        files=OUTPUT_FILES["arrival_weather_impact"])
+    else:
+        for name in WEATHER_TABLES:          # no stale weather table from an earlier run next to this run's tables
+            shutil.rmtree(g / name, ignore_errors=True)
+        log.warning("No weather observation in Silver: the weather tables are not built")
+
+    tables = GOLD_TABLES + (WEATHER_TABLES if weather_available else ())
+    gold = {name: spark.read.parquet(str(g / name)) for name in tables}
 
     log.info("Top 10 airports by movements over the period:")
     (gold["airport_daily_ops"].groupBy("airport_icao", "airport_name", "iso_country")
@@ -312,6 +388,7 @@ def run(spark, settings):
         schema_problems = {name: schemas.compare(df.schema, schemas.GOLD[name]) for name, df in gold.items()}
         for name, problems in schema_problems.items():
             checks[f"{name}: schema as expected"] = not problems
+    figures["weather"] = weather_figures(gold) if weather_available else dict(available=False)
     for name, ok in checks.items():
         log.info("  %s  %s", "PASSED" if ok else "FAILED", name)
     for name, problems in schema_problems.items():

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,21 @@ from synthetic_opdi import START, END, write_site
 
 RUN_PIPELINE = Path(__file__).resolve().parents[1] / "run_pipeline.py"
 RUN_ID = "test-run"
+WEATHER_STATIONS = "LFBO,LFPG,EGLL,ZZZZ"         # ZZZZ: unknown to the archive (header only -> "empty")
+N_FILES = 5 + 3                                  # 3 OPDI + 2 reference files + 3 METAR files
+
+
+class SiteHandler(http.server.SimpleHTTPRequestHandler):
+    """Static files, plus the METAR archive query: /iem/asos.py?station=X&... -> /iem/X.csv."""
+
+    def translate_path(self, path):
+        parts = urllib.parse.urlsplit(path)
+        if parts.path.endswith("/iem/asos.py"):
+            path = f"/iem/{urllib.parse.parse_qs(parts.query)['station'][0]}.csv"
+        return super().translate_path(path)
+
+    def log_message(self, *args, **kwargs):
+        pass
 
 
 def run_cli(layers, env, *extra):
@@ -42,8 +58,7 @@ def pipeline_run(tmp_path_factory, site):
     data_root = tmp_path_factory.mktemp("data")
     expected = write_site(site)
 
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(site))
-    handler.log_message = lambda *a, **k: None
+    handler = functools.partial(SiteHandler, directory=str(site))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -53,6 +68,8 @@ def pipeline_run(tmp_path_factory, site):
            "OPDI_BASE_URL": f"{url}/opdi",
            "OPDI_AIRPORTS_URL": f"{url}/ourairports/airports.csv",
            "OPDI_RUNWAYS_URL": f"{url}/ourairports/runways.csv",
+           "OPDI_WEATHER_URL": f"{url}/iem/asos.py", "OPDI_WEATHER_STATIONS": WEATHER_STATIONS,
+           "OPDI_WEATHER_PAUSE_S": "0",
            "PYSPARK_PYTHON": sys.executable}
     logs = {}
     for layer in ("ingest", "bronze", "silver", "gold", "ml", "summary"):     # one process per layer, as in the CI
@@ -86,9 +103,9 @@ def test_bronze_keeps_every_row_with_lineage(pipeline_run, spark):
     assert flights.filter("_source_sha256 IS NULL OR _source_file IS NULL").count() == 0
     assert read(spark, data_root / "bronze" / "flight_events").count() == exp["bronze_events"]
     manifest = (data_root / "raw" / "manifest.csv").read_text()
-    assert manifest.count("downloaded") == 5                     # 3 OPDI files + 2 reference files
+    assert manifest.count("downloaded") == N_FILES               # 3 OPDI + 2 reference + 3 METAR files
     bronze = report(data_root, RUN_ID, "bronze")
-    assert len(bronze["files_built"]) == 5 and bronze["files_up_to_date"] == 0     # first run: everything built
+    assert len(bronze["files_built"]) == N_FILES and bronze["files_up_to_date"] == 0   # first run: everything built
 
 
 @pytest.mark.slow
@@ -198,12 +215,70 @@ def test_gold_figures(pipeline_run, spark):
 
 
 @pytest.mark.slow
+def test_weather_through_the_layers(pipeline_run, spark):
+    """METAR of the synthetic stations: downloaded for the real period, Bronze with lineage, Silver with quarantine
+    and deduplication, Gold weather of each hour (planted conditions), impact table and ML comparison."""
+    data_root, _, exp, _ = pipeline_run
+    w = exp["weather"]
+    ingest = report(data_root, RUN_ID, "ingest")
+    assert ingest["results"] == {"downloaded": N_FILES, "empty": 1}          # ZZZZ: no observation, file not kept
+    assert sorted(p.name for p in (data_root / "raw" / "weather").iterdir()) == [
+        f"metar_{st}_{START:%Y%m%d}_{END:%Y%m%d}.csv" for st in sorted(w["stations"])]
+    manifest = (data_root / "raw" / "manifest.csv").read_text()
+    assert f"year1={START.year}&month1={START.month}&day1={START.day}" in manifest       # real period, real year
+
+    bronze = read(spark, data_root / "bronze" / "metar")
+    assert bronze.count() == w["bronze"]
+    assert bronze.filter("_source_sha256 IS NULL OR _source_file IS NULL").count() == 0
+    assert {r[0] for r in bronze.select("station").distinct().collect()} == set(w["stations"])
+
+    silver = read(spark, data_root / "silver" / "weather_observations")
+    assert silver.count() == w["silver"]
+    assert silver.select("station_icao", "obs_time_utc").distinct().count() == w["silver"]   # deduplicated
+    q = read(spark, data_root / "quarantine" / "weather_observations")
+    assert {r[0]: r[1] for r in q.groupBy("_quarantine_reason").count().collect()} == w["quarantine"]
+    acc = report(data_root, RUN_ID, "silver")["row_accounting"]["weather_observations"]
+    assert (acc["out_of_scope"], acc["duplicates"]) == (w["out_of_scope"], w["duplicates"])
+    # present weather read token by token: VCSH (vicinity) is not precipitation, BR (mist) is not fog,
+    # a TSRA in the TEMPO forecast of the raw METAR is not a thunderstorm
+    lfpg = silver.filter("station_icao = 'LFPG'")
+    assert lfpg.filter("present_weather = 'VCSH' AND has_precipitation").count() == 0
+    assert lfpg.filter("present_weather = 'BR' AND (has_fog OR is_imc)").count() == 0
+    assert lfpg.filter("raw_metar LIKE '%TEMPO TSRA%' AND has_thunderstorm").count() == 0
+    assert silver.filter("ceiling_ft = 1200").count() == 4               # lowest BKN layer, not the FEW layer below
+
+    hourly = read(spark, data_root / "gold" / "airport_weather_hourly")
+    got = {}
+    for r in hourly.groupBy("airport_icao", "weather_category").count().collect():
+        got.setdefault(r[0], {})[r[1]] = r[2]
+    assert got == w["categories"]
+    north = hourly.filter("airport_icao = 'EGLL' AND weather_date = DATE'2026-06-15'")
+    assert {r[0] for r in north.select("wind_dir_deg").distinct().collect()} == {0.0}    # vector mean of 350 / 10
+
+    impact = read(spark, data_root / "gold" / "arrival_weather_impact")
+    assert {r[0] for r in impact.select("airport_icao").distinct().collect()} <= set(w["stations"])
+    gold = report(data_root, RUN_ID, "gold")
+    assert gold["checks"]["arrival_weather_impact: arrivals match silver_arrivals in complete hours with weather"]
+    assert gold["weather"]["airports"] == len(w["stations"])
+
+    ml = report(data_root, RUN_ID, "ml")["weather"]
+    assert ml["status"] in ("PASSED", "FAILED")
+    comparison = read(spark, data_root / "gold" / "ml_weather_comparison")
+    assert comparison.count() == 3
+    assert (data_root / "gold" / "ml_weather_feature_importance").exists() == (ml["status"] == "PASSED")
+    summary = json.loads((data_root / "pipeline_summary.json").read_text())
+    assert summary["weather"]["stations_with_data"] == len(w["stations"])
+    assert summary["weather"]["warnings"] == ["no observation for ['ZZZZ']"]
+
+
+@pytest.mark.slow
 def test_published_tables_match_their_schema_contract(pipeline_run, spark):
     from opdi_pipeline import schemas
     data_root, _, _, _ = pipeline_run
     for layer, contracts in [("silver", schemas.SILVER), ("gold", schemas.GOLD)]:
         for table, contract in contracts.items():
-            if table in ("ml_feature_importance", "ml_scenarios") and not (data_root / layer / table).exists():
+            if (table in ("ml_feature_importance", "ml_scenarios", "ml_weather_feature_importance")
+                    and not (data_root / layer / table).exists()):
                 continue                                    # model not published by this run (see test_gold_figures)
             assert schemas.compare(read(spark, data_root / layer / table).schema, contract) == [], (layer, table)
     gold = json.loads((data_root / "reports" / RUN_ID / "gold.json").read_text())
@@ -238,9 +313,9 @@ def test_rerun_is_idempotent(pipeline_run, spark):
     assert code == 0, out[-4000:]
     after = json.loads((data_root / "pipeline_summary.json").read_text())["tables"]
     assert [(t["table"], t["rows"]) for t in after] == [(t["table"], t["rows"]) for t in before]
-    assert report(data_root, "test-rerun", "ingest")["results"] == {"already_present": 5}
+    assert report(data_root, "test-rerun", "ingest")["results"] == {"already_present": N_FILES, "empty": 1}
     bronze = report(data_root, "test-rerun", "bronze")
-    assert bronze["files_built"] == [] and bronze["files_up_to_date"] == 5        # incremental: nothing rebuilt
+    assert bronze["files_built"] == [] and bronze["files_up_to_date"] == N_FILES  # incremental: nothing rebuilt
     assert bronze["reconciliation_passed"]
 
 
@@ -257,9 +332,10 @@ def test_republished_file_rebuilds_only_its_period(pipeline_run, site, spark):
 
     code, out = run_cli("ingest,bronze", {**env, "OPDI_RUN_ID": "test-republish"})
     assert code == 0, out[-4000:]
-    assert report(data_root, "test-republish", "ingest")["results"] == {"republished": 1, "already_present": 4}
+    assert report(data_root, "test-republish", "ingest")["results"] == {"republished": 1, "already_present": N_FILES - 1,
+                                                                          "empty": 1}
     bronze = report(data_root, "test-republish", "bronze")
-    assert bronze["files_built"] == [src.name] and bronze["files_up_to_date"] == 4
+    assert bronze["files_built"] == [src.name] and bronze["files_up_to_date"] == N_FILES - 1
     assert bronze["reconciliation_passed"]
 
     events = read(spark, data_root / "bronze" / "flight_events")
@@ -273,8 +349,26 @@ def test_republished_file_rebuilds_only_its_period(pipeline_run, site, spark):
     code, out = run_cli("bronze", {**env, "OPDI_RUN_ID": "test-full-refresh"}, "--full-refresh")
     assert code == 0, out[-4000:]
     bronze = report(data_root, "test-full-refresh", "bronze")
-    assert bronze["full_refresh"] and len(bronze["files_built"]) == 5 and bronze["reconciliation_passed"]
+    assert bronze["full_refresh"] and len(bronze["files_built"]) == N_FILES and bronze["reconciliation_passed"]
     assert read(spark, data_root / "bronze" / "flight_events").count() == exp["bronze_events"]
+
+
+@pytest.mark.slow
+def test_weather_off_contract_never_stops_the_pipeline(pipeline_run):
+    """A METAR file whose header changed (archive format change) is left out of Bronze and reported; the OPDI
+    tables are still built and reconciled, and the run goes on."""
+    data_root, env, _, _ = pipeline_run
+    raw = next((data_root / "raw" / "weather").glob("metar_LFPG_*.csv"))
+    original = raw.read_text()
+    raw.write_text(original.replace("wxcodes", "presentwx", 1))
+    try:
+        code, out = run_cli("bronze", {**env, "OPDI_RUN_ID": "test-weather-format"})
+    finally:
+        raw.write_text(original)
+    assert code == 0, out[-4000:]
+    bronze = report(data_root, "test-weather-format", "bronze")
+    assert bronze["weather_files_off_contract"] == [raw.name] and bronze["reconciliation_passed"]
+    assert raw.name not in {r["file"] for r in bronze["reconciliation"]}
 
 
 def ingestion_sha(data_root, name):

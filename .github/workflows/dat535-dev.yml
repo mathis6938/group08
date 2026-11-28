@@ -31,7 +31,7 @@ on:
         type: boolean
         default: false
       notebooks:
-        description: "Only execute the showcase notebooks 02, 04, 05 on the published PROD tables (read-only) and upload them"
+        description: "Only execute the showcase notebooks 02, 04, 05, 06 on the published PROD tables (read-only) and upload them"
         type: boolean
         default: false
 
@@ -204,14 +204,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Execute notebooks 02, 04 and 05 (they only read ~/opdi-data; figures go to projet_opdi/docs/figures)
+      - name: Execute notebooks 02, 04, 05 and 06 (they only read ~/opdi-data; figures go to projet_opdi/docs/figures)
         run: |
           source ~/spark-env/bin/activate
           OUT="$RUNNER_TEMP/notebooks"
           mkdir -p "$OUT"
           cd projet_opdi/notebooks
           status=0
-          for nb in 02_pipeline_walkthrough 04_gold_dashboard 05_arrival_efficiency; do
+          for nb in 02_pipeline_walkthrough 04_gold_dashboard 05_arrival_efficiency 06_weather; do
             echo "::group::$nb"
             if ! jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=1800 \
                    --output-dir "$OUT" "$nb.ipynb" > "$OUT/$nb.log" 2>&1; then
