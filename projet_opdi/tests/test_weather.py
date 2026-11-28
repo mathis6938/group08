@@ -1,9 +1,9 @@
-"""Weather (METAR): parsing of the archive fields, weather conditions, quality rules."""
+"""Weather (METAR): parsing of the archive fields, weather conditions, quality rules, hourly Gold aggregation."""
 import datetime
 
 import pytest
 
-from opdi_pipeline import weather
+from opdi_pipeline import gold, weather
 from opdi_pipeline.config import load_settings
 
 START, END = datetime.date(2026, 6, 9), datetime.date(2026, 6, 19)
@@ -82,3 +82,20 @@ def test_quality_rules_and_scope(spark):
     reasons = [r["_quarantine_reason"] for r in weather.flag_metar(std.filter("_in_scope")).collect()]
     assert reasons == ["UNPARSABLE_TIMESTAMP", "INVALID_WIND", "INVALID_WIND", "INVALID_VISIBILITY",
                        "INVALID_TEMPERATURE", "MISSING_STATION", None]
+
+
+def test_hourly_weather_and_category(spark):
+    """Gold SQL: worst condition of the hour, vector mean of the wind direction, most severe category first."""
+    settings = load_settings("dev")
+    rows = [dict(valid="2026-06-10 15:00", drct="350.00"), dict(valid="2026-06-10 15:30", drct="10.00"),
+            dict(valid="2026-06-10 16:00", wxcodes="-RA", sknt="22.00"), dict(valid="2026-06-10 16:30", gust="31.00"),
+            dict(valid="2026-06-10 17:00", wxcodes="+TSRA", vsby="0.31"), dict(valid="2026-06-10 18:00")]
+    obs = weather.standardize_metar(bronze_rows(spark, rows), settings.weather, START, END)
+    obs.createOrReplaceTempView("silver_weather_observations")
+    h = {r["weather_hour"]: r for r in spark.sql(gold.sql_text("airport_weather_hourly")).collect()}
+    assert h[15]["observations"] == 2 and h[15]["wind_dir_deg"] == 0.0 and h[15]["weather_category"] == "GOOD"
+    assert h[16]["max_gust_kt"] == 31.0 and h[16]["avg_wind_speed_kt"] == 15.0
+    assert h[16]["weather_category"] == "STRONG_WIND"                  # strong wind before precipitation
+    assert h[17]["weather_category"] == "THUNDERSTORM"                 # thunderstorm before low visibility
+    assert h[17]["min_visibility_m"] == pytest.approx(499, abs=1)
+    assert h[18]["weather_category"] == "GOOD"

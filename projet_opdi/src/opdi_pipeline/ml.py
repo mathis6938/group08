@@ -13,6 +13,8 @@ Publishes (when quality gate passes):
   - gold/ml_scenarios (airport_icao, scenario, demand_cap, predicted_total_min_before,
                        predicted_total_min_after, saving_min_per_day)
   - gold/airport_typology (airport_icao, airport_name, cluster, cluster_label, metrics...)
+  - gold/ml_weather_comparison, gold/ml_weather_feature_importance (weather.ml_comparison: the same model without
+    and with the weather of the arrival hour)
 """
 import datetime
 import shutil
@@ -149,8 +151,10 @@ def split_temporal(df, test_days):
     return train_df, test_df, split_date
 
 
-def train_and_evaluate_gbt(train_df, test_df, settings):
-    """Train GBTRegressor pipeline, compute feature importances, and evaluate against naive baseline."""
+def train_and_evaluate_gbt(train_df, test_df, settings, extra_num=()):
+    """Train GBTRegressor pipeline, compute feature importances, and evaluate against naive baseline.
+
+    extra_num: additional numerical features (weather comparison, weather.ml_comparison); none for the main model."""
     # Group rare operators on the training set: top 30 operators, else "OTHER"
     top_ops_rows = (
         train_df.groupBy("operator_icao").count()
@@ -179,7 +183,7 @@ def train_and_evaluate_gbt(train_df, test_df, settings):
     test_prepped = add_load_factor(test_prepped, airport_peak)
 
     cat_cols = ["dest_icao", "entry_sector", "arrival_runway", "aircraft_class", "operator_clean"]
-    num_cols = ["arrival_hour", "day_of_week", "hourly_demand", "prev_hourly_demand", "load_factor"]
+    num_cols = ["arrival_hour", "day_of_week", "hourly_demand", "prev_hourly_demand", "load_factor", *extra_num]
 
     indexers = [
         StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep")
@@ -642,6 +646,11 @@ def run(spark, settings):
         log.info("Wrote gold/airport_typology (%d airports, %d clusters, silhouette=%.3f)",
                  typology_meta["n_airports"], typology_meta["k"], typology_meta["silhouette"])
 
+    # 6. Weather: the same model trained without and with the weather of the arrival hour (airports with METAR)
+    with steps.step("weather comparison (GBT without / with weather)"):
+        from . import weather
+        weather_report = weather.ml_comparison(spark, settings, features_df)
+
     report = {
         "status": "PASSED" if beats_baseline else "FAILED",
         "beats_baseline": beats_baseline,
@@ -657,6 +666,7 @@ def run(spark, settings):
         "focus_airports": metrics["focus_airports"],
         "top_features": metrics["feature_importances"][:5],
         "typology": typology_meta,
+        "weather": weather_report,
         "durations_s": steps.durations,
     }
     write_report(settings, "ml", report)
