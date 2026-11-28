@@ -22,10 +22,12 @@ Weather conditions of an observation (thresholds in config/*.toml, [weather]):
 The ceiling is the height of the lowest broken (BKN), overcast (OVC) or vertical-visibility (VV) layer; no such
 layer means no ceiling (NULL). Nothing is imputed: an hour without observation has no weather row.
 """
+import shutil
+
 import pyspark.sql.functions as F
 from pyspark.sql.types import DoubleType
 
-from .common import log, write_table
+from .common import log, utc_now, write_table
 
 METAR_COLUMNS = ("station", "valid", "tmpc", "dwpc", "relh", "drct", "sknt", "gust", "vsby", "skyc1", "skyc2",
                  "skyc3", "skyc4", "skyl1", "skyl2", "skyl3", "skyl4", "wxcodes", "metar")
@@ -36,6 +38,10 @@ SILVER_COLUMNS = [
     "wind_dir_deg", "wind_speed_kt", "wind_gust_kt", "visibility_m", "ceiling_ft", "present_weather",
     "has_thunderstorm", "has_precipitation", "has_fog", "is_imc", "is_below_cat1", "is_strong_wind", "raw_metar",
     "_silver_processed_at_utc", "_source_file", "_ingestion_run_id", "_source_sha256"]
+# Weather features of the ML comparison (weather of the arrival hour, gold/airport_weather_hourly)
+ML_FEATURES = ["avg_wind_speed_kt", "max_gust_kt", "visibility_km", "ceiling_kft", "thunderstorm", "precipitation",
+               "fog", "imc", "below_cat1"]
+ML_TABLES = ("ml_weather_comparison", "ml_weather_feature_importance")
 
 
 # ---------------------------------------------------------------------------------------------- silver
@@ -146,3 +152,98 @@ def build_silver(spark, settings):
     return dict(available=s_n > 0, accounting=accounting, accounting_consistent=accounting["duplicates"] >= 0,
                 quarantine_reasons=reasons, observations_by_station=stations, stations_without_data=missing,
                 conditions=conditions)
+
+
+# ---------------------------------------------------------------------------------------------- ml
+def ml_frame(spark, settings, features_df):
+    """Arrival features of ml.build_arrival_ml_features + the weather of the arrival hour (airports with METAR)."""
+    w = spark.read.parquet(str(settings.gold_dir / "airport_weather_hourly"))
+    weather = w.filter(F.col("min_visibility_m").isNotNull() & F.col("avg_wind_speed_kt").isNotNull()).select(
+        F.col("airport_icao").alias("dest_icao"),
+        F.col("weather_date").alias("arrival_date"),
+        F.col("weather_hour").cast(DoubleType()).alias("arrival_hour"),     # double, as in the arrival features
+        "avg_wind_speed_kt",
+        F.coalesce("max_gust_kt", "avg_wind_speed_kt").alias("max_gust_kt"),
+        (F.least(F.col("min_visibility_m"), F.lit(10000.0)) / 1000.0).alias("visibility_km"),
+        # no BKN / OVC / VV layer: no ceiling, coded as a high ceiling (20 000 ft)
+        (F.least(F.coalesce(F.col("min_ceiling_ft"), F.lit(20000.0)), F.lit(20000.0)) / 1000.0).alias("ceiling_kft"),
+        *[F.col(src).cast(DoubleType()).alias(dst) for src, dst in [
+            ("has_thunderstorm", "thunderstorm"), ("has_precipitation", "precipitation"), ("has_fog", "fog"),
+            ("is_imc", "imc"), ("is_below_cat1", "below_cat1")]])
+    return features_df.join(weather, ["dest_icao", "arrival_date", "arrival_hour"], "inner")
+
+
+def remove_ml_tables(settings):
+    for name in ML_TABLES:                 # never leave the tables of an earlier run: they would look like this run's
+        shutil.rmtree(settings.gold_dir / name, ignore_errors=True)
+
+
+def ml_comparison(spark, settings, features_df):
+    """Same GBT as ml.py (same split, same hyperparameters), trained on the same arrivals without and with the weather
+    of the arrival hour, both compared with the naive baseline (mean per airport and hour) on the same test days.
+
+    gold/ml_weather_comparison is always written when the comparison runs (it is the evidence, good or bad);
+    gold/ml_weather_feature_importance only when the model with weather beats the naive baseline.
+    """
+    from .ml import split_temporal, train_and_evaluate_gbt
+
+    if not (settings.gold_dir / "airport_weather_hourly").exists():
+        remove_ml_tables(settings)
+        log.warning("Weather ML comparison skipped: no gold/airport_weather_hourly")
+        return dict(status="SKIPPED", reason="NO_WEATHER_TABLE")
+    data = ml_frame(spark, settings, features_df).persist()
+    n_rows = data.count()
+    if n_rows < 100:
+        data.unpersist()
+        remove_ml_tables(settings)
+        log.warning("Weather ML comparison skipped: only %d arrivals with weather", n_rows)
+        return dict(status="SKIPPED", reason="TOO_FEW_ARRIVALS_WITH_WEATHER", rows=n_rows)
+
+    train_df, test_df, split_date = split_temporal(data, settings.ml.test_days)
+    train_df, test_df = train_df.persist(), test_df.persist()
+    n_train, n_test = train_df.count(), test_df.count()
+    n_airports = data.select("dest_icao").distinct().count()
+    _, _, base = train_and_evaluate_gbt(train_df, test_df, settings)
+    _, _, with_weather = train_and_evaluate_gbt(train_df, test_df, settings, extra_num=ML_FEATURES)
+    naive = base["baseline"]                    # identical in both runs (same train and test sets)
+
+    def row(model, n_features, m, beats):
+        return dict(model=model, n_features=n_features, airports=n_airports, train_rows=n_train, test_rows=n_test,
+                    split_date=split_date, mae=float(m["mae"]), rmse=float(m["rmse"]), r2=float(m["r2"]),
+                    beats_naive_baseline=beats, _ml_built_at_utc=utc_now())
+
+    n_base = 10                                  # 5 categorical + 5 numerical features of ml.py
+    rows = [row("naive_baseline (mean per airport and hour)", 2, naive, None),
+            row("gbt_without_weather", n_base, base["model"], base["model"]["mae"] <= naive["mae"]),
+            row("gbt_with_weather", n_base + len(ML_FEATURES), with_weather["model"],
+                with_weather["model"]["mae"] <= naive["mae"])]
+    schema = ("model string, n_features int, airports bigint, train_rows bigint, test_rows bigint, split_date date, "
+              "mae double, rmse double, r2 double, beats_naive_baseline boolean, _ml_built_at_utc timestamp")
+    write_table(spark.createDataFrame(rows, schema), settings.gold_dir / "ml_weather_comparison", files=1)
+
+    weather_beats = rows[2]["beats_naive_baseline"]
+    if weather_beats:
+        now = utc_now()
+        fi = [{**r, "_ml_built_at_utc": now} for r in with_weather["feature_importances"]]
+        write_table(spark.createDataFrame(fi, "variable string, importance double, rank int, "
+                                              "_ml_built_at_utc timestamp"),
+                    settings.gold_dir / "ml_weather_feature_importance", files=1)
+    else:
+        shutil.rmtree(settings.gold_dir / "ml_weather_feature_importance", ignore_errors=True)
+
+    m0, m1 = base["model"], with_weather["model"]
+    weather_importance = round(sum(r["importance"] for r in with_weather["feature_importances"]
+                                   if r["variable"] in ML_FEATURES), 4)
+    log.info("Weather comparison on %s arrivals (%d airports): naive MAE %.3f | GBT without weather MAE %.3f R2 %.3f "
+             "| GBT with weather MAE %.3f R2 %.3f | weather share of the importance %.3f",
+             f"{n_rows:,}", n_airports, naive["mae"], m0["mae"], m0["r2"], m1["mae"], m1["r2"], weather_importance)
+    for t in (train_df, test_df, data):
+        t.unpersist()
+    return dict(status="PASSED" if weather_beats else "FAILED", rows=n_rows, airports=n_airports,
+                train_rows=n_train, test_rows=n_test, split_date=str(split_date),
+                naive_baseline=naive, without_weather=m0, with_weather=m1,
+                delta_mae_min=round(m0["mae"] - m1["mae"], 3), delta_r2=round(m1["r2"] - m0["r2"], 3),
+                weather_importance_share=weather_importance,
+                top_features_with_weather=with_weather["feature_importances"][:8],
+                focus_airports={"without_weather": base["focus_airports"],
+                                "with_weather": with_weather["focus_airports"]})

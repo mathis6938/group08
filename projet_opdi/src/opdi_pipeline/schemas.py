@@ -136,6 +136,23 @@ GOLD = {
         "avg_additional_min": "double", "p90_additional_min": "double",
         "avg_level_minutes": "double", "pct_with_holding": "double",
         "day_to_day_std": "double", "_ml_built_at_utc": "timestamp"},
+    "airport_weather_hourly": {
+        "airport_icao": "string", "weather_date": "date", "weather_hour": "int", "observations": "bigint",
+        "avg_temp_c": "double", "avg_wind_speed_kt": "double", "wind_dir_deg": "double", "max_gust_kt": "double",
+        "min_visibility_m": "double", "min_ceiling_ft": "double", "has_thunderstorm": "boolean",
+        "has_precipitation": "boolean", "has_fog": "boolean", "is_imc": "boolean", "is_below_cat1": "boolean",
+        "is_strong_wind": "boolean", "weather_category": "string", "_gold_built_at_utc": "timestamp"},
+    "arrival_weather_impact": {
+        "airport_icao": "string", "weather_category": "string", "hours": "bigint", "arrivals": "bigint",
+        "arrivals_measured": "bigint", "avg_additional_min": "double", "median_additional_min": "double",
+        "avg_level_minutes": "double", "pct_with_holding": "double", "holding_minutes": "double",
+        "airport_name": "string", "iso_country": "string", "_gold_built_at_utc": "timestamp"},
+    "ml_weather_comparison": {
+        "model": "string", "n_features": "int", "airports": "bigint", "train_rows": "bigint", "test_rows": "bigint",
+        "split_date": "date", "mae": "double", "rmse": "double", "r2": "double",
+        "beats_naive_baseline": "boolean", "_ml_built_at_utc": "timestamp"},
+    "ml_weather_feature_importance": {
+        "variable": "string", "importance": "double", "rank": "int", "_ml_built_at_utc": "timestamp"},
 }
 
 

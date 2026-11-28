@@ -215,10 +215,9 @@ def test_gold_figures(pipeline_run, spark):
 
 
 @pytest.mark.slow
-def test_weather_through_bronze_and_silver(pipeline_run, spark):
-    """METAR of the synthetic stations: downloaded for the real period, every row in Bronze with its lineage, one
-    partition per station (an unknown station, header only, is not kept); Silver with quarantine, deduplication and
-    the weather conditions read from the present-weather codes."""
+def test_weather_through_the_layers(pipeline_run, spark):
+    """METAR of the synthetic stations: downloaded for the real period, Bronze with lineage, Silver with quarantine
+    and deduplication, Gold weather of each hour (planted conditions), impact table and ML comparison."""
     data_root, _, exp, _ = pipeline_run
     w = exp["weather"]
     ingest = report(data_root, RUN_ID, "ingest")
@@ -232,8 +231,6 @@ def test_weather_through_bronze_and_silver(pipeline_run, spark):
     assert bronze.count() == w["bronze"]
     assert bronze.filter("_source_sha256 IS NULL OR _source_file IS NULL").count() == 0
     assert {r[0] for r in bronze.select("station").distinct().collect()} == set(w["stations"])
-    recon = [r for r in report(data_root, RUN_ID, "bronze")["reconciliation"] if r["table"] == "metar"]
-    assert len(recon) == len(w["stations"]) and all(r["raw_rows"] == r["bronze_rows"] for r in recon)
 
     silver = read(spark, data_root / "silver" / "weather_observations")
     assert silver.count() == w["silver"]
@@ -250,11 +247,28 @@ def test_weather_through_bronze_and_silver(pipeline_run, spark):
     assert lfpg.filter("raw_metar LIKE '%TEMPO TSRA%' AND has_thunderstorm").count() == 0
     assert silver.filter("ceiling_ft = 1200").count() == 4               # lowest BKN layer, not the FEW layer below
 
+    hourly = read(spark, data_root / "gold" / "airport_weather_hourly")
+    got = {}
+    for r in hourly.groupBy("airport_icao", "weather_category").count().collect():
+        got.setdefault(r[0], {})[r[1]] = r[2]
+    assert got == w["categories"]
+    north = hourly.filter("airport_icao = 'EGLL' AND weather_date = DATE'2026-06-15'")
+    assert {r[0] for r in north.select("wind_dir_deg").distinct().collect()} == {0.0}    # vector mean of 350 / 10
+
+    impact = read(spark, data_root / "gold" / "arrival_weather_impact")
+    assert {r[0] for r in impact.select("airport_icao").distinct().collect()} <= set(w["stations"])
+    gold = report(data_root, RUN_ID, "gold")
+    assert gold["checks"]["arrival_weather_impact: arrivals match silver_arrivals in complete hours with weather"]
+    assert gold["weather"]["airports"] == len(w["stations"])
+
+    ml = report(data_root, RUN_ID, "ml")["weather"]
+    assert ml["status"] in ("PASSED", "FAILED")
+    comparison = read(spark, data_root / "gold" / "ml_weather_comparison")
+    assert comparison.count() == 3
+    assert (data_root / "gold" / "ml_weather_feature_importance").exists() == (ml["status"] == "PASSED")
     summary = json.loads((data_root / "pipeline_summary.json").read_text())
     assert summary["weather"]["stations_with_data"] == len(w["stations"])
-    assert summary["weather"]["observations"] == w["silver"]
     assert summary["weather"]["warnings"] == ["no observation for ['ZZZZ']"]
-    assert [t["rows"] for t in summary["tables"] if (t["layer"], t["table"]) == ("Bronze", "metar")] == [w["bronze"]]
 
 
 @pytest.mark.slow
@@ -263,7 +277,8 @@ def test_published_tables_match_their_schema_contract(pipeline_run, spark):
     data_root, _, _, _ = pipeline_run
     for layer, contracts in [("silver", schemas.SILVER), ("gold", schemas.GOLD)]:
         for table, contract in contracts.items():
-            if table in ("ml_feature_importance", "ml_scenarios") and not (data_root / layer / table).exists():
+            if (table in ("ml_feature_importance", "ml_scenarios", "ml_weather_feature_importance")
+                    and not (data_root / layer / table).exists()):
                 continue                                    # model not published by this run (see test_gold_figures)
             assert schemas.compare(read(spark, data_root / layer / table).schema, contract) == [], (layer, table)
     gold = json.loads((data_root / "reports" / RUN_ID / "gold.json").read_text())

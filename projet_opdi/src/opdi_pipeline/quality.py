@@ -12,7 +12,9 @@ LAYER_TABLES = [
     ("Quarantine", "quarantine_dir", ["flights", "flight_events", "weather_observations"]),
     ("Gold", "gold_dir", ["airport_hourly_ops", "airport_daily_ops", "runway_usage", "airport_ground_times",
                           "arrival_reference", "airport_arrival_daily", "airport_arrival_hourly", "holding_hotspots",
-                          "ml_feature_importance", "ml_scenarios", "airport_typology"]),
+                          "ml_feature_importance", "ml_scenarios", "airport_typology",
+                          "airport_weather_hourly", "arrival_weather_impact", "ml_weather_comparison",
+                          "ml_weather_feature_importance"]),
 ]
 
 
