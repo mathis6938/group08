@@ -47,9 +47,8 @@
 \title{\textbf{European Flight Arrival Efficiency, Fuel Penalties \& Machine Learning}\\[0.4em]
 \large An End-to-End Medallion PySpark Pipeline on EUROCONTROL OPDI Data}
 \author{\textbf{Mathis Nancey} \quad \& \quad \textbf{Thomas Canisares--Morère}\\
-\small Group 08 \quad | \quad Course: DAT535 Data Engineering\\
-\small Department of Electrical Engineering and Computer Science, University of Stavanger (UiS)}
-\date{Production Run: \texttt{prod-8} (2026-11-09) \quad | \quad Academic Year 2026}
+\small Group 08 \quad | \quad DAT535 Data Engineering}
+\date{}
 
 \renewcommand{\floatpagefraction}{0.75}
 \setlength{\textfloatsep}{10pt plus 2pt minus 2pt}
@@ -60,9 +59,9 @@
 \maketitle
 
 \begin{abstract}
-This report documents a \textbf{PySpark 3.5} pipeline structured around the \textbf{Medallion Architecture} (Bronze, Silver, Gold, plus an ML layer). Over \textbf{58 days} (June 1 -- July 28, 2026) of \textbf{EUROCONTROL OPDI v0.0.2} data and the \textbf{OurAirports} reference data, the pipeline processes \textbf{3,304,717 flights}, \textbf{86,670,133 flight events} and \textbf{118,779,222 measurements} (5.46~GB in Bronze Parquet).
+This report documents a \textbf{PySpark 3.5} pipeline structured around the \textbf{Medallion Architecture} (Bronze, Silver, Gold, plus an ML layer). Over \textbf{58 days} (June 1 -- July 28, 2026) of \textbf{EUROCONTROL OPDI v0.0.2} data and the \textbf{OurAirports} reference data, plus the \textbf{METAR} weather reports of 34 airports, the pipeline processes \textbf{3,304,717 flights}, \textbf{86,670,133 flight events} and \textbf{118,779,222 measurements} (5.46~GB in Bronze Parquet) and 94,486 METAR observations.
 
-The served study measures the arrival efficiency at Paris-CDG, Toulouse and Stavanger, compared with London-Heathrow and Frankfurt: additional transit time from a 100~NM ring to the runway (Indicator A), level-offs and holdings during descent (Indicator B). In production run \texttt{prod-8}, \textbf{Heathrow} has the highest additional time of the five airports (4.9~min, measured on 14\,\% of its arrivals) and 12.7\,\% of its arrivals hold; its additional time grows with demand, from about 0.2~min below 20 arrivals per hour to 6.8~min at 40--49 arrivals per hour. \textbf{Paris-CDG} and \textbf{Frankfurt} rarely hold (2.9\,\%) but fly 4.6 and 4.1 minutes level per arrival, i.e.\ about 30 and 34 tonnes of fuel per day under a 12.7~kg/min hypothesis. \textbf{Toulouse} is fluid (1.9~min, 1.6~min of level flight); at \textbf{Stavanger} the runway coverage is too low to measure Indicator A. A Spark MLlib \texttt{GBTRegressor} beats a naive baseline (test MAE 2.74 vs 2.84~min, $R^2$ 0.135 vs 0.053); the destination airport is by far its most important variable.
+The served study measures the arrival efficiency at Paris-CDG, Toulouse and Stavanger, compared with London-Heathrow and Frankfurt: additional time from a 100~NM ring to the runway (A), level-offs and holdings during descent (B). In production run \texttt{prod-17}, \textbf{Heathrow} has the highest additional time of the five airports (4.9~min, measured on 14\,\% of its arrivals) and 12.7\,\% of its arrivals hold; its additional time grows with demand (0.2~min below 20 arrivals per hour, 6.8~min at 40--49). \textbf{Paris-CDG} and \textbf{Frankfurt} rarely hold (2.9\,\%) but fly 4.6 and 4.1 minutes level per arrival, i.e.\ about 30 and 34 tonnes of fuel per day under a 12.7~kg/min hypothesis. \textbf{Toulouse} is fluid (1.9~min, 1.6~min of level flight); at \textbf{Stavanger} the runway coverage is too low to measure Indicator A. A Spark MLlib \texttt{GBTRegressor} beats a naive baseline (test MAE 2.75 vs 2.84~min, $R^2$ 0.119 vs 0.053); the destination airport is by far its most important variable. Thunderstorm hours bring 7.4~min of additional time and 13\,\% of holdings (2.8~min and 2\,\% in good weather), but adding the weather does not improve the model (MAE 2.66 vs 2.64~min).
 \end{abstract}
 
 \section{Project Statement and Scope}
@@ -71,13 +70,13 @@ The served study measures the arrival efficiency at Paris-CDG, Toulouse and Stav
 The project builds an automated and reproducible pipeline that ingests the raw OPDI flight list, flight events and measurements, turns them into trusted and reusable Silver tables, and serves Gold tables for one analytical question: \emph{how efficient is the arrival phase at a given airport, and when and where is time (and fuel) lost?} The consumers are the analysis notebooks of the repository (Gold dashboard, arrival-efficiency study) and the ML layer.
 
 \paragraph{Operational problem.}
-When the demand approaches the runway capacity, air traffic control absorbs the delay in the air: \textbf{holdings} (racetrack patterns flown at a fixed level while waiting for the approach) and \textbf{level-offs} that interrupt a continuous descent (Continuous Descent Operations, CDO). Both cost time and fuel. As an order of magnitude we use a \textbf{fuel hypothesis of 12.7~kg per minute of level flight}, derived from the EUROCONTROL ECAC-wide CDO study (46~kg of fuel for 217~s of level flight per flight from the top of descent, 2017 traffic), and $\text{CO}_2 = 3.16 \times$ fuel. It is an average, not an aircraft performance model.
+Near runway capacity, air traffic control absorbs the delay in the air: \textbf{holdings} (racetrack patterns at a fixed level) and \textbf{level-offs} that interrupt a continuous descent (CDO). Both cost time and fuel. As an order of magnitude we use a \textbf{fuel hypothesis of 12.7~kg per minute of level flight}, derived from the EUROCONTROL ECAC-wide CDO study (46~kg of fuel for 217~s of level flight per flight from the top of descent, 2017 traffic), and $\text{CO}_2 = 3.16 \times$ fuel. It is an average, not an aircraft performance model.
 
 \paragraph{Focus airports.}
 Paris-CDG (\texttt{LFPG}, large hub, four parallel runways), Toulouse-Blagnac (\texttt{LFBO}, medium airport, commercial traffic and Airbus operations) and Stavanger-Sola (\texttt{ENZV}, regional airport of UiS with offshore helicopter traffic), compared with two benchmark hubs: London-Heathrow (\texttt{EGLL}, two runways) and Frankfurt (\texttt{EDDF}, four runways).
 
 \paragraph{Outside the scope.}
-OPDI v0.0.2 has no scheduled times, so punctuality is out of scope: all delays are an \textbf{additional transit time} with respect to an empirical unimpeded reference, inspired by EUROCONTROL's ASMA indicator. Weather is not included; the results are associations, not causal effects.
+OPDI v0.0.2 has no scheduled times, so punctuality is out of scope: all delays are an \textbf{additional transit time} with respect to an empirical unimpeded reference, inspired by EUROCONTROL's ASMA indicator. The weather is the one observed at the destination airport (METAR), not en route; all results are associations, not causal effects.
 
 \section{Dataset: Source, Suitability, and Limitations}
 
@@ -89,12 +88,13 @@ OPDI v0.0.2 has no scheduled times, so punctuality is out of scope: all delays a
         \item \texttt{flight\_events} (86,670,133 rows): milestones of each flight (level-start/level-end, top of climb/descent, flight-level crossings, runway and parking events) with time, position and altitude.
         \item \texttt{measurements} (118,779,222 rows): two cumulative values attached to events, \texttt{Distance flown (NM)} and \texttt{Time Passed (s)}.
     \end{itemize}
-    \item \textbf{OurAirports} (CSV, updated daily): \texttt{airports} (86,350 rows) and \texttt{runways} (48,412 rows) for coordinates, elevation and runway identifiers.
+    \item \textbf{OurAirports} (CSV, updated daily): \texttt{airports} (86,397 rows) and \texttt{runways} (49,909 rows) for coordinates, elevation and runway identifiers.
+    \item \textbf{METAR} (CSV, Iowa Environmental Mesonet archive, no API key): the airport weather reports (every 30 or 60~min: visibility, cloud layers, wind, present weather) of 34 destination airports for the real period of the scope (94,486 rows): the 30 airports with the most measured arrivals and the focus airports.
 \end{enumerate}
-In total 16 source files, i.e.\ 5.46~GB once stored in Bronze.
+In total 50 source files (16 OPDI and OurAirports, 34 METAR), i.e.\ 5.46~GB once stored in Bronze.
 
 \paragraph{Suitability for distributed processing.}
-The events and measurements (205~M rows together) must be filtered, windowed per flight and joined with the flights and the airport dimension. These are scans, shuffles and window functions over hundreds of millions of rows, a natural fit for Spark DataFrames and Spark SQL, run here in local mode on a VM with 4~vCPU and 7.8~GB of RAM.
+The events and measurements (205~M rows together) must be filtered, windowed per flight and joined with the flights and the airport dimension. Scans, shuffles and window functions over hundreds of millions of rows fit Spark DataFrames and Spark SQL, run here in local mode on a VM with 4~vCPU and 7.8~GB of RAM.
 
 \paragraph{Data quality risks (measured).}
 \begin{itemize}[noitemsep,topsep=2pt]
@@ -105,33 +105,19 @@ The events and measurements (205~M rows together) must be filtered, windowed per
 
 \section{Bronze Layer: Ingestion and Preservation}
 
-\paragraph{Ingestion.}
+\paragraph{Environment and ingestion method.}
+The pipeline runs on an Ubuntu VM of the UiS OpenStack cloud (4~vCPU, 7.8~GB RAM, Spark 3.5 in local mode, \texttt{/opt/spark}); development and production are two configurations on this VM with separate data folders and their own GitHub environments. The sources are files published in batches (monthly flight lists, ten-day windows of events, daily reference CSVs), sometimes republished, so we chose a \textbf{scheduled batch pull over HTTPS} rather than streaming: it matches the publication rhythm and makes every run reproducible from the manifest.
 \texttt{ingestion.py} asks the server for the size and \texttt{Last-Modified} date of each file (HTTP HEAD), downloads only new or republished files, and records every file in a manifest (URL, size, \texttt{Last-Modified}, SHA-256, run id, result). A disk guard (\texttt{min\_free\_gb = 4.0}) stops the downloads when the free space gets too low. In run \texttt{prod-4}, the republished OurAirports CSV files were detected and downloaded again.
 
 \paragraph{Preservation and lineage.}
-Bronze keeps the original columns and types, checked against a schema contract, and stores them in Parquet, partitioned by source period. Each row receives lineage columns: \texttt{\_source\_file}, \texttt{\_source\_period}, \texttt{\_source\_sha256}, \texttt{\_source\_last\_modified}, \texttt{\_ingestion\_run\_id}, \texttt{\_ingested\_at\_utc}, \texttt{\_bronze\_run\_id} and \texttt{\_bronze\_loaded\_at\_utc}. The lineage table is small and is joined with a broadcast join. A reconciliation compares the row counts of each raw file with Bronze (16/16 files in \texttt{prod-8}).
+Bronze keeps the original columns and types, checked against a schema contract, and stores them in Parquet, partitioned by source period. Each row receives lineage columns: \texttt{\_source\_file}, \texttt{\_source\_period}, \texttt{\_source\_sha256}, \texttt{\_source\_last\_modified}, \texttt{\_ingestion\_run\_id}, \texttt{\_ingested\_at\_utc}, \texttt{\_bronze\_run\_id} and \texttt{\_bronze\_loaded\_at\_utc}. The lineage table is small and is joined with a broadcast join. A reconciliation compares the row counts of each raw file with Bronze (50/50 files in \texttt{prod-17}). The METAR files follow the same path (manifest, contract on the CSV header, \texttt{bronze/metar} with every column as text, partitioned by station); as an enrichment, a METAR file off its contract is left out and reported instead of stopping the run.
 
 \paragraph{Incremental Bronze.}
 A state file (\texttt{bronze/\_state.json}) stores the SHA-256 of the source file behind each Bronze partition. Only the files that are new or whose SHA-256 changed are rebuilt, with a dynamic partition overwrite; \texttt{--full-refresh} forces a complete rebuild. The state is saved only after a successful reconciliation.
 
-\begin{lstlisting}[language=Python, caption={Selection of the files to rebuild in \texttt{bronze.py} (excerpt).}]
-def files_to_build(settings, files):
-    """Raw files whose Bronze copy is missing or comes from another version of the source file."""
-    sha_now = {name: r["sha256"] for name, r in ingestion.last_manifest_entries(settings).items()}
-    state = {} if settings.full_refresh else load_state(settings)
-    todo = {}
-    for table, paths in files.items():
-        for path in paths:
-            name = Path(path).name
-            up_to_date = (sha_now.get(name) is not None and state.get(name) == sha_now[name]
-                          and bronze_location(settings, table, name).exists())
-            if not up_to_date:
-                todo.setdefault(table, []).append(path)
-    return todo
-\end{lstlisting}
 
 \paragraph{Evidence.}
-The first full Bronze build took \textbf{525.7~s} (\texttt{prod-4}). In \texttt{prod-8} no source file had changed, so the Bronze tables step took \textbf{0.4~s}, with the reconciliation still passing on the 16 files.
+The first full Bronze build took \textbf{525.7~s} (\texttt{prod-4}). In \texttt{prod-8} no source file had changed, so the Bronze tables step took \textbf{0.4~s}. In \texttt{prod-17} only the two republished OurAirports files and the 34 new METAR files were built (\textbf{6.4~s}); the 14 OPDI files stayed untouched, and the reconciliation still checked all 50 files.
 
 \section{Silver Layer: Data Model, Quality, and Performance (Primary Focus)}
 
@@ -141,16 +127,17 @@ The first full Bronze build took \textbf{525.7~s} (\texttt{prod-4}). In \texttt{
     \item \texttt{silver/flight\_events}: one row per event (key \texttt{event\_id}); every event references an existing flight.
     \item \texttt{silver/arrivals}: one row per arrival with a known destination (1,866,643 rows): 100~NM ring entry (time, position, sector), runway entry, transit time, reference and additional time, level-off and holding summary.
     \item \texttt{silver/descent\_level\_offs}: one row per fused level-off during the descent (1,919,728 rows).
+    \item \texttt{silver/weather\_observations}: one row per METAR (station + time; 94,486 rows), typed (visibility in m, ceiling = lowest BKN/OVC/VV layer), with its conditions: IMC (visibility $<$ 5~km or ceiling $<$ 1,500~ft), below CAT~I (800~m / 200~ft), strong wind ($\ge$ 20~kt or gusts $\ge$ 30~kt), thunderstorm, precipitation and fog from the present-weather codes (not TEMPO).
 \end{itemize}
 The exploration of the real data shaped these definitions: OPDI splits one level flight into many short level-start/level-end pairs about 10~s apart (hence the fusion below), level events also exist on the ground for parked aircraft (excluded), OPDI's top-of-descent is missing for about one third of the arrivals (not used as a boundary), and the measurements are never attached to runway events.
 
 \subsection{Cleaning, standardisation, and quarantine}
-Silver converts the types and gives one form to missing values, removes duplicates, and applies quality rules. A row that fails a rule is not dropped silently: it goes to a quarantine table with the first rule it fails (e.g.\ \texttt{DURATION\_GT\_24H}, \texttt{INVALID\_COORDINATES}, \texttt{ORPHAN\_EVENT}). In \texttt{prod-8}, 625 flights (\texttt{DURATION\_GT\_24H}) and 9,100 events (\texttt{ORPHAN\_EVENT}, events of a flight that is not valid) were quarantined. A before/after report proves the row accounting: Bronze = out of scope + quarantined + duplicates + Silver (Table~\ref{tab:accounting}).
+All the processing uses \textbf{DataFrames and Spark SQL}, with no RDD and no Python UDF: the Catalyst optimiser then prunes columns and pushes filters into the Parquet scans, and the per-flight logic uses window functions instead of row-by-row code. The METAR are the least structured input: free-text weather groups (e.g.\ \texttt{-TSRA BR}) and cloud layers are turned into typed columns and flags with native expressions (\texttt{rlike}, \texttt{when}), still without UDFs. Silver converts the types and gives one form to missing values, removes duplicates, and applies quality rules. A row that fails a rule is not dropped silently: it goes to a quarantine table with the first rule it fails (e.g.\ \texttt{DURATION\_GT\_24H}, \texttt{INVALID\_COORDINATES}, \texttt{ORPHAN\_EVENT}). In \texttt{prod-17}, 625 flights (\texttt{DURATION\_GT\_24H}) and 9,100 events (\texttt{ORPHAN\_EVENT}, events of a flight that is not valid) were quarantined. The METAR rules (\texttt{UNPARSABLE\_TIMESTAMP}, \texttt{INVALID\_WIND}, \texttt{INVALID\_VISIBILITY}, \texttt{INVALID\_TEMPERATURE}, \texttt{MISSING\_STATION}) quarantined no row in \texttt{prod-17}; they are exercised by the tests. A before/after report proves the row accounting: Bronze = out of scope + quarantined + duplicates + Silver (Table~\ref{tab:accounting}).
 
 \begin{table}[htbp]
 \centering
 \small
-\caption{Row accounting across the layers (run \texttt{prod-8}).}
+\caption{Row accounting across the layers (run \texttt{prod-17}).}
 \footnotesize
 \label{tab:accounting}
 \begin{tabular}{llrrp{5.6cm}}
@@ -160,11 +147,13 @@ Silver converts the types and gives one form to missing values, removes duplicat
 Bronze & \texttt{flight\_list} & 3,304,717 & 3,304,717 & reconciled with the raw files \\
 Bronze & \texttt{flight\_events} & 86,670,133 & 86,670,133 & reconciled with the raw files \\
 Bronze & \texttt{measurements} & 118,779,222 & 118,779,222 & reconciled with the raw files \\
+Bronze & \texttt{metar} & 94,486 & 94,486 & reconciled with the 34 raw files \\
 \midrule
 Silver & \texttt{flights} & 3,304,717 & \textbf{3,127,830} & $-$175,452 out of scope, $-$810 duplicates, $-$625 quarantined \\
 Silver & \texttt{flight\_events} & 86,670,133 & \textbf{84,000,238} & $-$2,660,795 out of scope, $-$9,100 quarantined \\
 Silver & \texttt{arrivals} & 3,127,830 & \textbf{1,866,643} & flights with a known destination \\
 Silver & \texttt{descent\_level\_offs} & --- & \textbf{1,919,728} & fused level-offs \\
+Silver & \texttt{weather\_observations} & 94,486 & \textbf{94,486} & 0 out of scope, 0 duplicates, 0 quarantined \\
 \midrule
 Gold & airport movements & 3,127,830 & \textbf{3,636,308} & 1,767,608 departures, 1,868,700 arrivals \\
 \bottomrule
@@ -207,32 +196,25 @@ with_grouping = (
 \subsection{Performance: evidence and tuning}
 
 \paragraph{Where the time goes.}
-The final production run \texttt{prod-8} took 14~min~43~s for the deployment job (ingest 36~s, Bronze 19~s, Silver 10~min~35~s, Gold 1~min~8~s, ML 1~min~2~s), against 18~min~44~s for \texttt{prod-4} (first production run, before the arrival study), mainly thanks to the incremental Bronze. The slowest steps of \texttt{prod-8} are writing \texttt{silver/flight\_events} (263.9~s), the arrival study (215.7~s, of which 153.3~s for the level-offs and 55.8~s for the arrivals) and writing \texttt{quarantine/flight\_events} (104.7~s).
+The final production run \texttt{prod-17} took 17~min~5~s for the deployment job (ingest 2~min~42~s, Bronze 31~s, Silver 10~min~7~s, Gold 1~min~14~s, ML 1~min~44~s) (14~min~43~s for \texttt{prod-8}, 18~min~44~s for \texttt{prod-4}, before the incremental Bronze). The extra time is the first download of the 34 METAR files (2~s pause per request to the public archive) and the ML weather comparison (44.5~s); the weather costs only 4.7~s in Silver and 4.7~s in Gold. The slowest steps are writing \texttt{silver/flight\_events} (243.6~s), the arrival study (205.5~s, of which 147.5~s for the level-offs and 51.6~s for the arrivals) and writing \texttt{quarantine/flight\_events}.
 
 \paragraph{Incident \texttt{prod-5}.}
-The first version of the arrival study received the \emph{lazy} Silver DataFrames, so Spark recomputed the whole Silver chain (86~M events) several times, and the run failed after 13~minutes with \texttt{java.lang.OutOfMemoryError: GC overhead limit exceeded}. The fix (PR~\#12):
-\begin{enumerate}[noitemsep,topsep=2pt]
-    \item read the \emph{written} Silver tables instead of the lazy DataFrames;
-    \item read only the needed columns, and keep only the events within 300~NM of the destination, cached on disk;
-    \item join a single measurement type (\texttt{Distance flown (NM)}) instead of aggregating the 119~M measurements;
-    \item write \texttt{silver/descent\_level\_offs} first, then build \texttt{silver/arrivals} from it.
-\end{enumerate}
-The next run (\texttt{prod-6}) passed with an arrival step of 217~s; it took 215.7~s in \texttt{prod-8}.
+The first version of the arrival study received the \emph{lazy} Silver DataFrames, so Spark recomputed the whole Silver chain (86~M events) several times, and the run failed after 13~minutes with \texttt{java.lang.OutOfMemoryError: GC overhead limit exceeded}. The fix (PR~\#12): (1) read the \emph{written} Silver tables instead of the lazy DataFrames; (2) read only the needed columns and the events within 300~NM of the destination, cached on disk; (3) join a single measurement type (\texttt{Distance flown (NM)}) instead of aggregating the 119~M measurements; (4) write \texttt{silver/descent\_level\_offs} first, then build \texttt{silver/arrivals} from it.
+The next run (\texttt{prod-6}) passed with an arrival step of 217~s; it took 205.5~s in \texttt{prod-17}.
 
 \paragraph{Other choices and what was not tuned.}
-Small tables (lineage, airport dimension) are joined with broadcast joins, and the events are partitioned by source period. The quarantine write recomputes the event rules for only 9,100 rows (about 100~s): identified, but not optimised, since a full production run takes about 14 minutes for a monthly schedule; caching the flagged events (and a 4~GB driver) would be the next steps if the volume grew.
+Small tables (lineage, airport dimension) are broadcast, and the events are partitioned by source period. The quarantine write recomputes the event rules for only 9,100 rows (about 100~s): identified but not optimised for a monthly schedule; caching the flagged events (and a 4~GB driver) would come next if the volume grew; the Silver cost grows linearly with the number of events.
 
-\paragraph{Scalability.}
-The Silver cost grows linearly with the number of events. Late or republished source files only trigger the rebuild of their own Bronze partitions; a schema change in a source file fails the Bronze schema contract before any processing.
 
-\FloatBarrier
+
 \section{Gold Layer: Serving the Outcome}
 
 Gold is written in \textbf{Spark SQL} (one query per table in \texttt{src/opdi\_pipeline/sql/}) and differs from Silver: smaller tables, aggregated for one question each.
 \begin{itemize}[noitemsep,topsep=2pt]
     \item \textbf{Traffic:} \texttt{airport\_daily\_ops} (43,397 rows), \texttt{airport\_hourly\_ops} (474,130), \texttt{runway\_usage} (23,500), \texttt{airport\_ground\_times} (43,397).
     \item \textbf{Arrival efficiency:} \texttt{arrival\_reference} (3,046), \texttt{airport\_arrival\_daily} (41,334), \texttt{airport\_arrival\_hourly} (381,863), \texttt{holding\_hotspots} (20,438).
-    \item \textbf{Correctness and readiness:} 30 validation checks (reconciliation with Silver, ranges, consistency, schema contracts) all passed in \texttt{prod-8}. Gold is published (\texttt{\_SUCCESS} marker and a \texttt{run\_status} history) only if every check passes; otherwise the marker is removed and the run fails. The regularity check flags the incomplete hours so that the consumers can exclude them.
+    \item \textbf{Weather:} \texttt{airport\_weather\_hourly} (47,281 airport hours: worst visibility and ceiling, mean wind, vector-mean direction, maximum gust, one category per hour, THUNDERSTORM $>$ LOW\_VISIBILITY $>$ IMC $>$ STRONG\_WIND $>$ PRECIPITATION $>$ GOOD; an hour without METAR has no row) and \texttt{arrival\_weather\_impact} (168 rows: arrival indicators per airport and category).
+    \item \textbf{Correctness and readiness:} 38 validation checks (reconciliation with Silver, ranges, consistency, one row per airport hour, every arrival counted once in one weather category, schema contracts) all passed in \texttt{prod-17}. Gold is published (\texttt{\_SUCCESS} marker, \texttt{run\_status} history) only if every check passes; the regularity check flags the incomplete hours for the consumers.
 \end{itemize}
 
 \section{Machine Learning}
@@ -242,30 +224,40 @@ A Spark MLlib \texttt{GBTRegressor} (20 iterations, depth 5) explains the additi
 \begin{itemize}[noitemsep,topsep=2pt]
     \item \textbf{Features:} airport, entry sector, runway, aircraft class, operator (top 30), hour, day of week, hourly demand, previous-hour demand, and load factor (demand / airport's 90th-percentile demand). The number of level-offs is not a feature: it is part of the delay being explained.
     \item \textbf{Temporal split:} training before 2026-07-14 (534,683 arrivals), test on the last 14 days (200,937 arrivals).
-    \item \textbf{Quality gate:} the model must beat a naive baseline (mean per airport and hour). Model: MAE 2.74~min, RMSE 4.44, $R^2$ 0.135; baseline: MAE 2.84, RMSE 4.64, $R^2$ 0.053. The model was therefore published. Per focus airport, however, the gain is nil (LFPG 2.65 vs 2.66, EDDF 2.53 vs 2.56, LFBO 1.87 vs 1.86) or negative (EGLL 4.28 vs 4.10).
+    \item \textbf{Quality gate:} the model must beat a naive baseline (mean per airport and hour). Model: MAE 2.75~min, RMSE 4.48, $R^2$ 0.119; baseline: MAE 2.84, RMSE 4.64, $R^2$ 0.053. The model was therefore published. Per focus airport, however, the gain is small (EDDF 2.52 vs 2.56), nil (LFPG 2.66 vs 2.66, LFBO 1.86 vs 1.86) or negative (EGLL 4.29 vs 4.10).
 \end{itemize}
 
 \subsection{Variable importance and demand-smoothing scenario}
-The variable importance (Figure~\ref{fig:ml}, left) is dominated by the destination airport (0.56), then the aircraft class (0.16), the runway (0.08), the hour (0.07) and the load factor (0.05). These are importances in the trees, not shares of explained variance: the model explains 13.5\,\% of the variance.
+The variable importance (Figure~\ref{fig:ml}, left) is dominated by the destination airport (0.55), then the aircraft class (0.15), the runway (0.09), the hour (0.07) and the load factor (0.05). These are importances in the trees, not shares of explained variance: the model explains 11.9\,\% of the variance.
 
-The scenario caps the hourly demand at the airport's 90th percentile and moves the excess flights to the nearest hours with room (same day, test period). Predicted savings: 7.0~min/day at Frankfurt (cap 51/h, 7 flights moved per day), 6.8 at Toulouse (cap 8/h), 1.8 at Paris-CDG (cap 35/h, 19 moved per day), 0 at Stavanger and $-0.5$ at Heathrow (cap 45/h). The negative value at Heathrow shows the limit of one global model for more than 600 airports with only 14\,\% of Heathrow's arrivals measured: it does not capture the demand effect visible in the descriptive data (Figure~\ref{fig:saturation}), which remains the stronger evidence.
+The scenario caps the hourly demand at the airport's 90th percentile and moves the excess flights to the nearest hours with room (same day). Predicted savings: 8.7~min/day at Frankfurt (cap 51/h, 7 flights moved per day), 6.4 at Toulouse (cap 8/h), 0.9 at Paris-CDG (cap 35/h, 19 moved per day), 0.7 at Heathrow (cap 45/h, 7 moved per day) and 0 at Stavanger. The tiny value at Heathrow ($-0.5$ in \texttt{prod-8} on the same data) shows the limit of one global model for 600+ airports with 14\,\% of Heathrow's arrivals measured: the descriptive demand effect (Figure~\ref{fig:saturation}) remains the stronger evidence.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.52\textwidth]{figures/07_model_and_scenario.png}
+\caption{Variable importance of the gradient-boosted trees (left) and predicted minutes saved per day by the demand-smoothing scenario (right).}
+\label{fig:ml}
+\end{figure}
 
 \subsection{Airport typology}
 A \texttt{StandardScaler} + \texttt{KMeans} clustering, with $k$ chosen by the silhouette among 3--6, groups 119 representative airports (at least 100 measured arrivals and 30\,\% coverage) into $k=3$ clusters (silhouette 0.55; Figure~\ref{fig:europe}, right): ``large airports, fluid arrivals'' (23, e.g.\ EDDF, EHAM, LEMD), ``medium airports, fluid arrivals'' (77, e.g.\ LFBO) and ``small airports, high additional time and frequent holdings'' (19). EGLL and LFPG are not clustered (coverage below 30\,\%).
 
-\FloatBarrier
+\subsection{Does the weather improve the model?}
+The same GBT (features, hyperparameters, split) is trained on the 488,552 arrivals at the 34 METAR airports, without and with the weather of the arrival hour (visibility, ceiling, wind, gust; IMC, CAT~I, fog, precipitation, thunderstorm flags). Without weather: MAE 2.638~min, $R^2$ 0.143; with weather: MAE 2.658, $R^2$ 0.125; naive baseline: 2.726. The weather variables take 13.6\,\% of the importance (gusts and mean wind first), yet the test error does not improve: bad-weather hours are few (about 1 in 9), partly absorbed by the airport, runway and demand variables, and on a 14-day summer test period the extra variables mainly add noise.
+
 \section{Results at the Focus Airports}
 
 \begin{table}[htbp]
 \centering
 \small
-\caption{Arrival efficiency at the focus airports (\texttt{prod-8}, 58 days, complete hours).}
+\caption{Arrival efficiency at the focus airports (\texttt{prod-17}, 58 days, complete hours).}
 \label{tab:results}
+\footnotesize
 \begin{tabular}{lrrrrr}
 \toprule
  & \textbf{LFBO} & \textbf{EDDF} & \textbf{LFPG} & \textbf{EGLL} & \textbf{ENZV} \\
 \midrule
-Arrivals & 6,265 & 37,768 & 29,504 & 38,004 & 4,264 \\
+Arrivals & 6,264 & 37,767 & 29,504 & 38,002 & 4,263 \\
 100~NM ring entry & 86.3\,\% & 97.1\,\% & 98.1\,\% & 97.1\,\% & 47.7\,\% \\
 Runway entry & 83.4\,\% & 82.8\,\% & 26.4\,\% & 14.2\,\% & 13.9\,\% \\
 Measured transit (A) & 77.7\,\% & 81.8\,\% & 26.2\,\% & 13.8\,\% & 1.1\,\% (48) \\
@@ -285,12 +277,6 @@ Fuel hypothesis (level flight) & 2.2 t/day & 34 t/day & 30 t/day & 37 t/day & 0.
 \footnotesize Level-off minutes per arrival by band: sum over the 58 days of the Gold table \texttt{airport\_arrival\_daily} divided by the arrivals.
 \end{table}
 
-\begin{figure}[!htbp]
-\centering
-\includegraphics[width=0.85\textwidth]{figures/06_focus_airports.png}
-\caption{Focus airports: additional arrival time with its coverage (left), level-off minutes per arrival by flight-level band (centre), share of arrivals with a holding and fuel hypothesis (right).}
-\label{fig:focus}
-\end{figure}
 
 \paragraph{London-Heathrow --- demand-driven delay.}
 12.7\,\% of the arrivals hold (32,802 holding minutes over 58 days), and the level-offs are concentrated between FL70 and FL100 (2.27~min per arrival) and FL100--200 (1.24~min). The holdings form four zones, one per quadrant around the airport (Figure~\ref{fig:holdings}), consistent with Heathrow's four holding stacks. The additional time grows with the demand: about 0.1--0.2~min below 20 arrivals per hour, 2.4~min at 20--29, 4.5~min at 30--39 and 6.8~min at 40--49 (Figure~\ref{fig:saturation}). The worst hours are the morning wave (07--08 UTC, about 8--10~min; Figure~\ref{fig:heatmaps}).
@@ -302,14 +288,17 @@ Both airports rarely hold (2.9\,\%) but fly 4.6~min (CDG) and 4.1~min (Frankfurt
 Toulouse is fluid: 1.9~min of additional time (1.8--2.3~min whatever the demand), 1.6~min of level flight and 0.7\,\% of arrivals with a holding. Stavanger shows only 0.2~min of level flight and 0.2\,\% of holdings, but its Indicator A cannot be measured (48 measured arrivals) and less than half of its arrivals are even seen entering the 100~NM ring: its low values partly reflect the poor receiver coverage, and must be read with care.
 
 \paragraph{Europe-wide.}
-Among the airports with at least 10,000 arrivals and 50\,\% coverage (mean of the daily averages), the highest additional times are at London-Gatwick (4.3~min), Lisbon (3.9) and Milan-Malpensa (3.7), the lowest at Stockholm (2.0) and Budapest (1.9) (computed in run \texttt{prod-6}, whose Gold arrival tables are the same as in \texttt{prod-8}; Figure~\ref{fig:europe}).
+Among the airports with $\ge$ 10,000 arrivals and 50\,\% coverage, the highest additional times are at London-Gatwick (4.3~min), Lisbon (3.9) and Milan-Malpensa (3.7), the lowest at Stockholm (2.0) and Budapest (1.9) (Figure~\ref{fig:europe}).
+
+\paragraph{Weather.}
+89\,\% of the 47,281 airport hours have good weather (70\,\% at Stavanger, 98\,\% at Barcelona). Over the 34 airports, every adverse category raises the additional time (Figure~\ref{fig:weather}): 2.8~min in good weather, 3.3 with precipitation, 3.5 in IMC, 3.9 with strong wind, 4.2 below CAT~I, and \textbf{7.4~min in thunderstorm hours}, which also double the level flight (6.3 vs 2.7~min) and multiply the holdings by six (13.4 vs 2.2\,\%). Low visibility raises holdings (7.2\,\%) but not level flight; at Heathrow, IMC hours reach 7.5~min against 4.8. Weather does not explain away the demand effect (Figure~\ref{fig:weatherdemand}): at Heathrow, adverse and good-weather hours have the same mean demand (33.5 vs 33.2 arrivals) and both curves rise with it, adverse weather adding 0.7 to 3.3~min on top; at Paris-CDG, adverse hours are busier (31 vs 23 arrivals), so part of their extra time is demand.
 
 \paragraph{Recommendations (hedged).}
-(1) Heathrow: the dependence on demand points to arrival flow management (spreading the morning wave, sequencing before the holding stacks). (2) Paris-CDG and Frankfurt: little holding but 4--5 minutes of level flight per arrival point to continuous-descent procedures. (3) Toulouse and Stavanger: no significant gain to expect on the arrival phase.
+(1) Heathrow: the dependence on demand points to arrival flow management (spreading the morning wave, sequencing before the holding stacks). (2) Paris-CDG and Frankfurt: little holding but 4--5 minutes of level flight per arrival point to continuous-descent procedures. (3) Toulouse and Stavanger: no significant gain to expect on the arrival phase. (4) Thunderstorms: the few storm hours cost the most per flight; they call for tactical flow measures rather than structural ones.
 
 \begin{figure}[!htbp]
 \centering
-\includegraphics[width=0.72\textwidth]{figures/01_europe_additional_time_and_typology.png}
+\includegraphics[width=0.58\textwidth]{figures/01_europe_additional_time_and_typology.png}
 \caption{Additional arrival time at 110 representative airports (left) and KMeans typology of 119 airports (right).}
 \label{fig:europe}
 \end{figure}
@@ -332,59 +321,69 @@ Among the airports with at least 10,000 arrivals and 50\,\% coverage (mean of th
 
 \begin{figure}[!htbp]
 \centering
-\includegraphics[width=0.78\textwidth]{figures/03_hour_day_heatmaps.png}
+\begin{minipage}[t]{0.49\textwidth}
+\centering
+\includegraphics[width=\linewidth]{figures/03_hour_day_heatmaps.png}
 \caption{Mean additional arrival time by hour (UTC) and day of the week.}
 \label{fig:heatmaps}
-\end{figure}
-
-\begin{figure}[!htbp]
+\end{minipage}\hfill
+\begin{minipage}[t]{0.49\textwidth}
 \centering
-\includegraphics[width=0.7\textwidth]{figures/05_real_descent_profiles.png}
-\caption{Real descent profiles (last hour before the runway): one flight with holding (level-offs highlighted) and one continuous descent, at Heathrow and Paris-CDG.}
+\includegraphics[width=\linewidth]{figures/05_real_descent_profiles.png}
+\caption{Real descent profiles (last hour before the runway): with holding (level-offs highlighted) and continuous, at Heathrow and Paris-CDG.}
 \label{fig:profiles}
+\end{minipage}
 \end{figure}
 
 \begin{figure}[!htbp]
 \centering
-\includegraphics[width=0.75\textwidth]{figures/07_model_and_scenario.png}
-\caption{Variable importance of the gradient-boosted trees (left) and predicted minutes saved per day by the demand-smoothing scenario (right).}
-\label{fig:ml}
+\includegraphics[width=0.62\textwidth]{figures/09_weather_impact.png}
+\caption{Arrival indicators by weather category of the arrival hour (34 airports, complete hours; dashed line: good weather).}
+\label{fig:weather}
+\vspace{4pt}
+\includegraphics[width=0.62\textwidth]{figures/10_weather_or_demand.png}
+\caption{Additional arrival time by number of arrivals in the hour (bins of 10), hours with good and adverse weather.}
+\label{fig:weatherdemand}
 \end{figure}
 
 \FloatBarrier
 \section{End-to-End Delivery and Operations}
 
 \paragraph{Reproducibility and environments.}
-The code is a Python package with one module per layer (\texttt{src/opdi\_pipeline/}), run by a command-line entry point, \texttt{run\_pipeline.py}, with the options \texttt{--env} (\texttt{dev} or \texttt{prod}) and \texttt{--layer}. Two configurations: \texttt{config/dev.toml} (10-day sample, June 9--19, data in \texttt{\textasciitilde/opdi-data-dev}) and \texttt{config/prod.toml} (full period, \texttt{\textasciitilde/opdi-data}). Run instructions: README.
+A Python package with one module per layer (\texttt{src/opdi\_pipeline/}), run by \texttt{run\_pipeline.py -{}-env dev|prod -{}-layer ...}; \texttt{config/dev.toml} (10-day sample, \texttt{\textasciitilde/opdi-data-dev}) and \texttt{config/prod.toml} (full period, \texttt{\textasciitilde/opdi-data}). Run instructions: README.
 
-\paragraph{Tests (46 pytest tests).}
-Unit tests of the configuration, ingestion, Silver rules, arrival rules, ML functions and schemas; a static check that the notebooks only call existing package functions; and an end-to-end test of every layer through the CLI on a synthetic OPDI dataset served by a fake EUROCONTROL server, with planted defects (duplicates, orphan events, holdings, ground level-offs) and exact expected values.
+\paragraph{Tests (70 pytest tests).}
+Unit tests of the configuration, ingestion, Silver and arrival rules, ML, schemas and METAR parsing (units, ceiling, weather codes, thresholds, quarantine, hourly aggregation); a static check of the notebooks; and an end-to-end test of every layer through the CLI on a synthetic OPDI dataset served by a fake EUROCONTROL server, and a fake METAR archive, with planted defects (duplicates, orphan events, holdings, ground level-offs, invalid or duplicated METAR, a station unknown to the archive) and exact expected values.
 
 \paragraph{CI/CD with GitHub Actions.}
-A feature branch is merged into \texttt{dev} by pull request: the tests run on a GitHub-hosted runner, then the whole pipeline runs on the dev sample on the VM through a self-hosted runner. A pull request from \texttt{dev} to \texttt{main} triggers the production run on the VM after a \textbf{manual approval} (GitHub environment \texttt{main}). Schedules: nightly dev run, monthly production run. On-demand jobs: data exploration and notebook execution. Each run uploads its logs, JSON reports and Gold tables as artifacts.
+A feature branch is merged into \texttt{dev} by pull request: tests on a GitHub-hosted runner, then the whole pipeline on the dev sample on the VM (self-hosted runner). A pull request from \texttt{dev} to \texttt{main} triggers the production run on the VM after a \textbf{manual approval} (GitHub environment \texttt{main}). Nightly dev and monthly production schedules; on-demand exploration and notebook execution (the figures of this report come from them, on the \texttt{prod-17} tables). Each run uploads its logs, reports and Gold tables as artifacts.
 
 \paragraph{Observability and quality gates.}
-Every run writes JSON reports and a \texttt{pipeline\_summary.json}. Seven quality gates must pass (all passed in \texttt{prod-8}): Bronze schema contract, Bronze reconciliation, Silver row accounting, no orphan event in Silver, Silver schema contracts, Gold validation, Gold published.
+Every run writes JSON reports and a \texttt{pipeline\_summary.json}; seven quality gates (Bronze contract and reconciliation, Silver accounting, no orphan event, Silver contracts, Gold validation, Gold published) all passed in \texttt{prod-17}.
 
 \section{Reflection and Limitations}
 
 \subsection{What worked, what did not}
 \begin{itemize}[noitemsep,topsep=2pt]
-    \item \textbf{Worked:} the incremental Bronze (525.7~s $\rightarrow$ 0.4~s when nothing changed); writing intermediate tables and reading them back instead of chaining lazy DataFrames; pruning columns and events early; the quality gates and run reports, which make the state of every run visible; the end-to-end test on synthetic data, run on every pull request before anything reaches the VM.
-    \item \textbf{Did not work at first:} passing lazy DataFrames between the Silver steps and the arrival study (\texttt{prod-5} out of memory). Lesson: on this volume, materialise the large intermediate results and measure before tuning.
-    \item \textbf{To improve:} per-airport models and weather data, caching the flagged events for the quarantine write, and a wider period.
+    \item \textbf{Worked:} the incremental Bronze (525.7~s $\rightarrow$ 0.4~s when nothing changed); materialising intermediate tables instead of chaining lazy DataFrames; pruning columns and events early; quality gates and run reports; the end-to-end test on synthetic data on every pull request.
+    \item \textbf{Failed at first:} lazy DataFrames passed from Silver to the arrival study (\texttt{prod-5} out of memory). Lesson: materialise large intermediate results and measure before tuning.
+    \item \textbf{Added after the presentation:} the METAR weather went through every layer (manifest, contract, quarantine, Gold validation, tests) without changing any table. \textbf{To improve:} per-airport models, en-route weather and winds aloft, caching the flagged events for the quarantine write, and a wider period (winter weather).
 \end{itemize}
 
 \subsection{Limitations}
-No scheduled times (no punctuality, only additional time over an empirical reference); no weather, so part of the variance is unexplained and the results are associations, not causality; partial and uneven runway coverage (Table~\ref{tab:results}); a percentile reference cannot see a delay suffered by almost every flight of a group; the fuel figures rest on an average hypothesis (12.7~kg/min), not an aircraft performance model; 14-hour source gap on June 9; OPDI v0.0.2 is a beta product.
+No scheduled times (only additional time over an empirical reference); weather only at the destination, for 34 airports in summer; associations, not causality; uneven runway coverage (Table~\ref{tab:results}); a percentile reference misses a delay suffered by nearly every flight of a group; fuel from an average hypothesis, not a performance model; 14-hour source gap on June 9; OPDI v0.0.2 is a beta product.
+
+\section{Use of AI Tools}
+We used Claude (Anthropic), mainly for debugging and research, and to help edit this report. Every suggestion was reviewed and adapted by us, and went through the pull requests, tests and dev runs like the rest of the code. We remain responsible for, and able to explain, all submitted work.
 
 \section*{References}
 \begin{footnotesize}
-\begin{enumerate}[noitemsep,topsep=2pt]
+\begin{enumerate}[nosep,leftmargin=*]
     \item EUROCONTROL. \textit{Open Performance Data Initiative (OPDI)}, v0.0.2. \url{https://www.eurocontrol.int/performance/data/}
     \item OurAirports. \textit{Open data downloads} (airports, runways). \url{https://ourairports.com/data/}
     \item EUROCONTROL. \textit{Continuous climb and descent operations} (CDO study, 2017 traffic). \url{https://www.eurocontrol.int/concept/continuous-climb-and-descent-operations}
-    \item Group 08 repository: \url{https://github.com/mathis6938/group08}. Production run \texttt{prod-8} (2026-11-09).
+    \item Iowa Environmental Mesonet. \textit{ASOS / METAR data download}. \url{https://mesonet.agron.iastate.edu/}
+    \item Group 08 repository: \url{https://github.com/mathis6938/group08}. Production run \texttt{prod-17} (2026-11-28).
 \end{enumerate}
 \end{footnotesize}
 
