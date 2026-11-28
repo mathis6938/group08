@@ -47,9 +47,8 @@
 \title{\textbf{European Flight Arrival Efficiency, Fuel Penalties \& Machine Learning}\\[0.4em]
 \large An End-to-End Medallion PySpark Pipeline on EUROCONTROL OPDI Data}
 \author{\textbf{Mathis Nancey} \quad \& \quad \textbf{Thomas Canisares--Morère}\\
-\small Group 08 \quad | \quad Course: DAT535 Data Engineering\\
-\small Department of Electrical Engineering and Computer Science, University of Stavanger (UiS)}
-\date{Production Run: \texttt{prod-17} (2026-11-28) \quad | \quad Academic Year 2026}
+\small Group 08 \quad | \quad DAT535 Data Engineering}
+\date{}
 
 \renewcommand{\floatpagefraction}{0.75}
 \setlength{\textfloatsep}{10pt plus 2pt minus 2pt}
@@ -106,7 +105,8 @@ The events and measurements (205~M rows together) must be filtered, windowed per
 
 \section{Bronze Layer: Ingestion and Preservation}
 
-\paragraph{Ingestion.}
+\paragraph{Environment and ingestion method.}
+The pipeline runs on an Ubuntu VM of the UiS OpenStack cloud (4~vCPU, 7.8~GB RAM, Spark 3.5 in local mode, \texttt{/opt/spark}); development and production are two configurations on this VM with separate data folders and their own GitHub environments. The sources are files published in batches (monthly flight lists, ten-day windows of events, daily reference CSVs), sometimes republished, so we chose a \textbf{scheduled batch pull over HTTPS} rather than streaming: it matches the publication rhythm and makes every run reproducible from the manifest.
 \texttt{ingestion.py} asks the server for the size and \texttt{Last-Modified} date of each file (HTTP HEAD), downloads only new or republished files, and records every file in a manifest (URL, size, \texttt{Last-Modified}, SHA-256, run id, result). A disk guard (\texttt{min\_free\_gb = 4.0}) stops the downloads when the free space gets too low. In run \texttt{prod-4}, the republished OurAirports CSV files were detected and downloaded again.
 
 \paragraph{Preservation and lineage.}
@@ -132,7 +132,7 @@ The first full Bronze build took \textbf{525.7~s} (\texttt{prod-4}). In \texttt{
 The exploration of the real data shaped these definitions: OPDI splits one level flight into many short level-start/level-end pairs about 10~s apart (hence the fusion below), level events also exist on the ground for parked aircraft (excluded), OPDI's top-of-descent is missing for about one third of the arrivals (not used as a boundary), and the measurements are never attached to runway events.
 
 \subsection{Cleaning, standardisation, and quarantine}
-Silver converts the types and gives one form to missing values, removes duplicates, and applies quality rules. A row that fails a rule is not dropped silently: it goes to a quarantine table with the first rule it fails (e.g.\ \texttt{DURATION\_GT\_24H}, \texttt{INVALID\_COORDINATES}, \texttt{ORPHAN\_EVENT}). In \texttt{prod-17}, 625 flights (\texttt{DURATION\_GT\_24H}) and 9,100 events (\texttt{ORPHAN\_EVENT}, events of a flight that is not valid) were quarantined. The METAR rules (\texttt{UNPARSABLE\_TIMESTAMP}, \texttt{INVALID\_WIND}, \texttt{INVALID\_VISIBILITY}, \texttt{INVALID\_TEMPERATURE}, \texttt{MISSING\_STATION}) quarantined no row in \texttt{prod-17}; they are exercised by the tests. A before/after report proves the row accounting: Bronze = out of scope + quarantined + duplicates + Silver (Table~\ref{tab:accounting}).
+All the processing uses \textbf{DataFrames and Spark SQL}, with no RDD and no Python UDF: the Catalyst optimiser then prunes columns and pushes filters into the Parquet scans, and the per-flight logic uses window functions instead of row-by-row code. The METAR are the least structured input: free-text weather groups (e.g.\ \texttt{-TSRA BR}) and cloud layers are turned into typed columns and flags with native expressions (\texttt{rlike}, \texttt{when}), still without UDFs. Silver converts the types and gives one form to missing values, removes duplicates, and applies quality rules. A row that fails a rule is not dropped silently: it goes to a quarantine table with the first rule it fails (e.g.\ \texttt{DURATION\_GT\_24H}, \texttt{INVALID\_COORDINATES}, \texttt{ORPHAN\_EVENT}). In \texttt{prod-17}, 625 flights (\texttt{DURATION\_GT\_24H}) and 9,100 events (\texttt{ORPHAN\_EVENT}, events of a flight that is not valid) were quarantined. The METAR rules (\texttt{UNPARSABLE\_TIMESTAMP}, \texttt{INVALID\_WIND}, \texttt{INVALID\_VISIBILITY}, \texttt{INVALID\_TEMPERATURE}, \texttt{MISSING\_STATION}) quarantined no row in \texttt{prod-17}; they are exercised by the tests. A before/after report proves the row accounting: Bronze = out of scope + quarantined + duplicates + Silver (Table~\ref{tab:accounting}).
 
 \begin{table}[htbp]
 \centering
@@ -372,6 +372,9 @@ Every run writes JSON reports and a \texttt{pipeline\_summary.json}; seven quali
 
 \subsection{Limitations}
 No scheduled times (only additional time over an empirical reference); weather only at the destination, for 34 airports in summer; associations, not causality; uneven runway coverage (Table~\ref{tab:results}); a percentile reference misses a delay suffered by nearly every flight of a group; fuel from an average hypothesis, not a performance model; 14-hour source gap on June 9; OPDI v0.0.2 is a beta product.
+
+\section{Use of AI Tools}
+We used Claude (Anthropic), mainly for debugging and research, and to help edit this report. Every suggestion was reviewed and adapted by us, and went through the pull requests, tests and dev runs like the rest of the code. We remain responsible for, and able to explain, all submitted work.
 
 \section*{References}
 \begin{footnotesize}
